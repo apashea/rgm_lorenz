@@ -329,50 +329,62 @@ def vmp_two_level_states(
     S1 = int(B1.shape[0])
     qs1_grid = jnp.full((T, H1, W1, S1), 1.0 / S1, dtype=jnp.float32)
 
+    # ----- Level-1 update: per-site chains of length T -----
+
     def update_level1(qs0_grid_current: jnp.ndarray,
                       qs1_grid_current: jnp.ndarray) -> jnp.ndarray:
         log_lik1 = bottom_up_message_level0_to_level1(qs0_grid_current, D1, states_grid1)
+        # log_lik1: (T, H1, W1, S1)
 
-        def update_site(qs1_site: jnp.ndarray,
-                        log_lik1_site: jnp.ndarray) -> jnp.ndarray:
-            def fwd_bwd(qs_):
-                def forward_messages(qs_):
-                    msgs = []
-                    prev_q = qs_[0]
-                    msgs.append(jnp.log(jnp.clip(E1, 1e-16)))
-                    for t in range(1, T):
-                        msg = jnp.log(jnp.clip(B1 @ prev_q, 1e-16))
-                        msgs.append(msg)
-                        prev_q = qs_[t]
-                    return jnp.stack(msgs, axis=0)
+        def update_site_chain(qs1_chain: jnp.ndarray,
+                              log_lik_chain: jnp.ndarray) -> jnp.ndarray:
+            """
+            qs1_chain:    (T, S1)
+            log_lik_chain:(T, S1)
+            """
+            def forward_messages(qs_):
+                msgs = []
+                prev_q = qs_[0]
+                msgs.append(jnp.log(jnp.clip(E1, 1e-16)))
+                for t in range(1, T):
+                    msg = jnp.log(jnp.clip(B1 @ prev_q, 1e-16))
+                    msgs.append(msg)
+                    prev_q = qs_[t]
+                return jnp.stack(msgs, axis=0)
 
-                def backward_messages(qs_):
-                    msgs = []
-                    next_q = qs_[-1]
-                    msgs.append(jnp.zeros_like(next_q))
-                    for t in range(T - 2, -1, -1):
-                        msg = jnp.log(jnp.clip(B1.T @ next_q, 1e-16))
-                        msgs.append(msg)
-                        next_q = qs_[t]
-                    msgs = msgs[::-1]
-                    return jnp.stack(msgs, axis=0)
+            def backward_messages(qs_):
+                msgs = []
+                next_q = qs_[-1]
+                msgs.append(jnp.zeros_like(next_q))
+                for t in range(T - 2, -1, -1):
+                    msg = jnp.log(jnp.clip(B1.T @ next_q, 1e-16))
+                    msgs.append(msg)
+                    next_q = qs_[t]
+                msgs = msgs[::-1]
+                return jnp.stack(msgs, axis=0)
 
+            def vmp_iter(qs_):
                 m_plus = forward_messages(qs_)
                 m_minus = backward_messages(qs_)
-                ln_qs = log_lik1_site + m_plus + m_minus
+                ln_qs = log_lik_chain + m_plus + m_minus  # all (T, S1)
                 return nn.softmax(ln_qs, axis=1)
 
             def body_fun(_, qs_):
-                return fwd_bwd(qs_)
+                return vmp_iter(qs_)
 
-            return jax.lax.fori_loop(0, 2, body_fun, qs1_site)
+            qs_init = qs1_chain
+            qs_final = jax.lax.fori_loop(0, 2, body_fun, qs_init)
+            return qs_final
 
-        qs1_grid_new = jax.vmap(
-            jax.vmap(update_site, in_axes=(0, 0)),
-            in_axes=(0, 0)
-        )(qs1_grid_current, log_lik1)
-
+        # vmap over spatial sites (H1, W1), each with a (T, S1) chain
+        update_site_chain_vmap = jax.vmap(
+            jax.vmap(update_site_chain, in_axes=(1, 1), out_axes=1),
+            in_axes=(1, 1), out_axes=1
+        )
+        qs1_grid_new = update_site_chain_vmap(qs1_grid_current, log_lik1)
         return qs1_grid_new
+
+    # ----- Level-0 update: per-patch chains of length T with top-down bias -----
 
     def update_level0(qs0_grid_current: jnp.ndarray,
                       qs1_grid_current: jnp.ndarray) -> jnp.ndarray:
@@ -402,47 +414,54 @@ def vmp_two_level_states(
 
             return jax.vmap(bias_for_time)(jnp.arange(T))
 
-        log_prior_bias0 = build_topdown_prior()
+        log_prior_bias0 = build_topdown_prior()  # (T, H0, W0, S0)
 
-        def update_site(qs0_site: jnp.ndarray,
-                        log_bias_site: jnp.ndarray) -> jnp.ndarray:
-            def fwd_bwd(qs_):
-                def forward_messages(qs_):
-                    msgs = []
-                    prev_q = qs_[0]
-                    msgs.append(jnp.log(jnp.clip(E0, 1e-16)))
-                    for t in range(1, T):
-                        msg = jnp.log(jnp.clip(B0 @ prev_q, 1e-16))
-                        msgs.append(msg)
-                        prev_q = qs_[t]
-                    return jnp.stack(msgs, axis=0)
+        def update_site_chain(qs0_chain: jnp.ndarray,
+                              log_bias_chain: jnp.ndarray) -> jnp.ndarray:
+            """
+            qs0_chain:    (T, S0)
+            log_bias_chain:(T, S0)
+            """
+            def forward_messages(qs_):
+                msgs = []
+                prev_q = qs_[0]
+                msgs.append(jnp.log(jnp.clip(E0, 1e-16)))
+                for t in range(1, T):
+                    msg = jnp.log(jnp.clip(B0 @ prev_q, 1e-16))
+                    msgs.append(msg)
+                    prev_q = qs_[t]
+                return jnp.stack(msgs, axis=0)
 
-                def backward_messages(qs_):
-                    msgs = []
-                    next_q = qs_[-1]
-                    msgs.append(jnp.zeros_like(next_q))
-                    for t in range(T - 2, -1, -1):
-                        msg = jnp.log(jnp.clip(B0.T @ next_q, 1e-16))
-                        msgs.append(msg)
-                        next_q = qs_[t]
-                    msgs = msgs[::-1]
-                    return jnp.stack(msgs, axis=0)
+            def backward_messages(qs_):
+                msgs = []
+                next_q = qs_[-1]
+                msgs.append(jnp.zeros_like(next_q))
+                for t in range(T - 2, -1, -1):
+                    msg = jnp.log(jnp.clip(B0.T @ next_q, 1e-16))
+                    msgs.append(msg)
+                    next_q = qs_[t]
+                msgs = msgs[::-1]
+                return jnp.stack(msgs, axis=0)
 
+            def vmp_iter(qs_):
                 m_plus = forward_messages(qs_)
                 m_minus = backward_messages(qs_)
-                ln_qs = log_bias_site + m_plus + m_minus
+                ln_qs = log_bias_chain + m_plus + m_minus
                 return nn.softmax(ln_qs, axis=1)
 
             def body_fun(_, qs_):
-                return fwd_bwd(qs_)
+                return vmp_iter(qs_)
 
-            return jax.lax.fori_loop(0, 1, body_fun, qs0_site)
+            qs_init = qs0_chain
+            qs_final = jax.lax.fori_loop(0, 1, body_fun, qs_init)
+            return qs_final
 
-        qs0_grid_new = jax.vmap(
-            jax.vmap(update_site, in_axes=(0, 0)),
-            in_axes=(0, 0)
-        )(qs0_grid_current, log_prior_bias0)
-
+        # vmap over (H0, W0) sites, each with a (T, S0) chain
+        update_site_chain_vmap = jax.vmap(
+            jax.vmap(update_site_chain, in_axes=(1, 1), out_axes=1),
+            in_axes=(1, 1), out_axes=1
+        )
+        qs0_grid_new = update_site_chain_vmap(qs0_grid_current, log_prior_bias0)
         return qs0_grid_new
 
     qs0_current = qs0_grid
