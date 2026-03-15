@@ -210,14 +210,12 @@ def infer_lowest_level_patches(
     num_iter_lowest: int = 8,
 ) -> Tuple[jnp.ndarray, float]:
     """
-    Run VMP at the lowest level independently for each patch:
+    Run VMP at the lowest level independently for each patch, using a
+    Python loop over (h0, w0) to keep memory usage manageable.
 
       - obs_grid: (T, H0, W0, O)
       - for each (h0, w0): run vmp_single_chain on (T, O) chain
       - stack results into qs0_grid: (T, H0, W0, S0)
-
-    This respects the generative structure (independent patch chains
-    given A, B, E) and avoids a single gigantic chain.
 
     Args:
         level0: lowest-level LorenzLevel (A, B_states, E_states)
@@ -236,22 +234,26 @@ def infer_lowest_level_patches(
     T, H0, W0, O = obs_grid.shape
     S0 = A0.shape[0]
 
-    # vmap vmp_single_chain over (H0, W0)
-    def infer_chain_for_patch(obs_patch: jnp.ndarray) -> Tuple[jnp.ndarray, float]:
-        # obs_patch: (T, O)
-        qs_chain, F_chain = vmp_single_chain(A0, B0, E0, obs_patch, num_iter=num_iter_lowest)
-        return qs_chain, F_chain
+    # Jitted single-chain inference
+    vmp_single_chain_jit = jax.jit(vmp_single_chain, static_argnames=("num_iter",))
 
-    # First vmap over spatial dimension W0, then H0
-    vmap_over_w = jax.vmap(infer_chain_for_patch, in_axes=1, out_axes=(1, 1))
-    vmap_over_hw = jax.vmap(vmap_over_w, in_axes=1, out_axes=(1, 1))
+    # We'll accumulate results in host (NumPy) arrays to avoid excessive device memory
+    qs0_host = np.zeros((T, H0, W0, S0), dtype=np.float32)
+    F_sum = 0.0
+    num_patches = H0 * W0
 
-    qs_all, F_all = vmap_over_hw(obs_grid)   # qs_all: (T, H0, W0, S0), F_all: (H0, W0)
+    for h0 in range(H0):
+        for w0 in range(W0):
+            obs_patch = obs_grid[:, h0, w0, :]         # (T, O)
+            qs_chain, F_chain = vmp_single_chain_jit(A0, B0, E0, obs_patch, num_iter=num_iter_lowest)
+            qs_chain_host = np.array(qs_chain)         # move to host
+            qs0_host[:, h0, w0, :] = qs_chain_host
+            F_sum += float(F_chain)
 
-    # Average free energy across patches for a simple diagnostic
-    F_avg = F_all.mean()
+    qs0_grid = jnp.array(qs0_host)          # back to device
+    F_avg = F_sum / float(num_patches)
 
-    return qs_all, F_avg
+    return qs0_grid, F_avg
 
 
 # -----------------------------------------------------------------------------
