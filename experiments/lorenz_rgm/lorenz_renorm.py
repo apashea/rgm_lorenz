@@ -19,7 +19,6 @@ for the Lorenz image example.
 from typing import Dict, Any, Tuple, List
 
 import numpy as np
-import jax
 import jax.numpy as jnp
 
 
@@ -73,8 +72,7 @@ def _build_parent_mapping_for_group(
     for a single group-location identity.
 
     Args:
-        child_patterns: (N, 4) array of integer child states,
-                        where N = number of time points * number of group-sites.
+        child_patterns: (N, 4) array of integer child states.
 
     Returns:
         parent_ids: (N,) array of parent state indices (int64)
@@ -84,7 +82,10 @@ def _build_parent_mapping_for_group(
     patterns_as_tuples = [tuple(row.tolist()) for row in child_patterns]
     unique_patterns, inverse = np.unique(patterns_as_tuples,
                                          return_inverse=True)
-    parent_ids = inverse.astype(np.int64)  # 1D int array
+    # inverse is 1D (N,), ensure plain int64 array
+    parent_ids = np.asarray(inverse, dtype=np.int64)  # (N,)
+
+    # pattern_to_parent maps each unique pattern tuple to its local index
     pattern_to_parent = {
         pattern: int(idx) for idx, pattern in enumerate(unique_patterns)
     }
@@ -146,14 +147,12 @@ def rg_step_level(
 
             parent_ids_local, pattern_to_parent_local = \
                 _build_parent_mapping_for_group(patterns_hw)
-
-            # Ensure 1D int array
-            parent_ids_local = np.asarray(parent_ids_local, dtype=np.int64)
+            # parent_ids_local: (T,) int64 local parent indices
 
             # Assign global parent indices for each local parent
             local_to_global: Dict[int, int] = {}
             for pattern, local_idx in pattern_to_parent_local.items():
-                local_idx_int = int(local_idx)
+                local_idx_int = int(local_idx)  # scalar
                 global_idx = global_parent_index
                 global_parent_index += 1
                 local_to_global[local_idx_int] = global_idx
