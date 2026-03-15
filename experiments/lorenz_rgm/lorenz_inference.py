@@ -7,13 +7,11 @@ This module provides:
   - Two-level state inference with spatial renormalization:
       * bottom-up messages from level 0 to level 1 via D
       * top-down messages from level 1 to level 0 via D
-  - Top-level path inference using expected free energy over paths.
+  - Top-level path inference using expected free energy over paths
+    computed via lorenz_efe.py (risk + ambiguity - epistemic).
 
-Expected free energy G(u) for a path factor at the top level is computed
-in terms of:
-  - predicted future observations at the lowest level,
-  - preferences over observations,
-  - epistemic (information gain) terms, in a simplified but RGM-aligned form.
+This is a Lorenz-specific instance of RGM-style inference and is structured
+to be extended further for full RGM behaviour.
 """
 
 from typing import List, Dict, Any, Tuple, Optional
@@ -23,8 +21,11 @@ import jax.numpy as jnp
 from jax import nn
 
 from .lorenz_model import LorenzHierarchy, LorenzLevel
-from .lorenz_data import build_lorenz_patch_dataset
 from . import maths as rgm_maths  # adapted from pymdp.jax.maths
+from .lorenz_efe import (
+    compute_expected_free_energy_paths,
+    update_path_posterior_from_G,
+)
 
 
 # -----------------------------------------------------------------------------
@@ -88,7 +89,6 @@ def build_preference_distribution_lowest(
         C = C / C.sum()
         return C
 
-    # empirical distribution
     C = obs.mean(axis=0)
     C = C / (C.sum() + 1e-8)
     return C
@@ -187,13 +187,13 @@ def bottom_up_message_level0_to_level1(
     states_grid1: jnp.ndarray,
 ) -> jnp.ndarray:
     """
-    Compute a simple bottom-up "pseudo-likelihood" for each Level-1 state
+    Compute a bottom-up "pseudo-likelihood" for each Level-1 state
     from Level-0 posterior beliefs and the deterministic D mapping.
 
     Args:
         qs0_grid: (T, H0, W0, S0) posterior over Level-0 states per patch.
         D1: (S1, child_config_dim=4) array of child state patterns.
-        states_grid1: (T, H1, W1) integer states for Level-1 (used for layout).
+        states_grid1: (T, H1, W1) integer states for Level-1 (layout).
 
     Returns:
         log_lik1: (T, H1, W1, S1) log "likelihood" contributions at Level 1.
@@ -240,10 +240,15 @@ def vmp_two_level_states(
     num_iter: int = 4,
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """
-    Perform a simple coupled VMP over Level-0 and Level-1 states.
+    Perform coupled VMP over Level-0 and Level-1 states.
 
-    See previous version for detailed comments; this function is unchanged
-    from the prior step except for minor refactoring.
+    - Level 0: updated by A0, B0, E0 and top-down log messages from Level 1.
+    - Level 1: updated by bottom-up log messages from Level 0 via D1,
+               plus B1 and E1.
+
+    Current simplifications:
+      - Level-1 spatial sites are treated as independent copies of the
+        same chain model (same B1, E1).
     """
     A0 = level0.A
     B0 = level0.B_states
@@ -392,198 +397,7 @@ def vmp_two_level_states(
 
 
 # -----------------------------------------------------------------------------
-# 4. Expected free energy for top-level paths
-# -----------------------------------------------------------------------------
-
-def compute_expected_obs_lowest(
-    qs0_grid: jnp.ndarray,
-    level0: LorenzLevel,
-) -> jnp.ndarray:
-    """
-    Compute predicted observation distribution at the lowest level
-    given posterior over lowest-level states.
-
-    Args:
-        qs0_grid: (T, H0, W0, S0)
-        level0: LorenzLevel with A (S0, O)
-
-    Returns:
-        qo_t: (T, O) predicted observation distributions averaged over space.
-    """
-    A0 = level0.A  # (S0, O)
-    T, H0, W0, S0 = qs0_grid.shape
-    O = A0.shape[1]
-
-    # For each time, average qs0 over spatial sites, then multiply by A0.
-    def pred_obs_t(qs0_t: jnp.ndarray) -> jnp.ndarray:
-        # qs0_t: (H0, W0, S0)
-        qs_mean = qs0_t.mean(axis=(0, 1))  # (S0,)
-        qo = qs_mean @ A0  # (O,)
-        qo = qo / (qo.sum() + 1e-8)
-        return qo
-
-    qo_t = jax.vmap(pred_obs_t)(qs0_grid)  # (T, O)
-    return qo_t
-
-
-def compute_expected_free_energy_paths(
-    level_top: LorenzLevel,
-    level0: LorenzLevel,
-    qs1_grid: jnp.ndarray,
-    qs0_grid: jnp.ndarray,
-    C: jnp.ndarray,
-    gamma: float = 16.0,
-) -> jnp.ndarray:
-    """
-    Compute expected free energy G(u_t) for paths at the top level.
-
-    Simplifications:
-      - We assume a path factor u_t at the top level that modulates state
-        transitions at level 1 (not yet explicitly in B1), but here we use
-        a coarse approximation:
-          * expected observations are derived from current qs0_grid,
-            independent of u (since we have not yet encoded B(s'|s,u)).
-          * risk term: expected negative log preference under C.
-          * epistemic term: a simple state-entropy reduction proxy.
-
-    Args:
-        level_top: top-level LorenzLevel (with num_paths > 0)
-        level0: lowest-level LorenzLevel (for A)
-        qs1_grid: (T, H1, W1, S1) top-level state posteriors
-        qs0_grid: (T, H0, W0, S0) lowest-level state posteriors
-        C: (O,) preference distribution over lowest-level outcomes
-        gamma: precision over expected free energy (for later softmax)
-
-    Returns:
-        G_tu: (T, U) expected free energy per time and path (simplified)
-    """
-    U = level_top.num_paths
-    if U == 0:
-        return None
-
-    T = qs1_grid.shape[0]
-    A0 = level0.A
-    O = A0.shape[1]
-
-    # Predicted obs from qs0 (same for all u in this simplified version)
-    qo_t = compute_expected_obs_lowest(qs0_grid, level0)  # (T, O)
-
-    # Risk term: expected negative log preference
-    log_C = jnp.log(jnp.clip(C, 1e-16))
-
-    def risk_t(qo: jnp.ndarray) -> float:
-        # E_qo[-log C(o)]
-        return -(qo * log_C).sum()
-
-    risk_vec = jax.vmap(risk_t)(qo_t)  # (T,)
-
-    # Epistemic term (very simplified): encourage states with high entropy
-    # reduction – here we just use negative entropy of qs1 as proxy.
-    def epistemic_t(qs1_t: jnp.ndarray) -> float:
-        # qs1_t: (H1, W1, S1)
-        # Average entropy across sites
-        def ent_site(qs_site: jnp.ndarray) -> float:
-            return - (qs_site * jnp.log(jnp.clip(qs_site, 1e-16))).sum()
-        ent_sites = jax.vmap(jax.vmap(ent_site))(qs1_t)
-        ent_mean = ent_sites.mean()
-        # epistemic term ~ -entropy (prefer more certainty / info gain)
-        return -ent_mean
-
-    epistemic_vec = jax.vmap(epistemic_t)(qs1_grid)  # (T,)
-
-    # Combine terms into G_t; in this simplified version, G does not depend on u
-    G_t = risk_vec + epistemic_vec  # (T,)
-
-    # Broadcast to U paths; later, when B(s'|s,u) is explicit, G will differ by u
-    G_tu = jnp.broadcast_to(G_t[:, None], (T, U))  # (T, U)
-
-    return G_tu
-
-
-def update_top_level_paths_via_efe(
-    level_top: LorenzLevel,
-    level0: LorenzLevel,
-    qs1_grid: jnp.ndarray,
-    qs0_grid: jnp.ndarray,
-    C: jnp.ndarray,
-    gamma: float = 16.0,
-) -> jnp.ndarray:
-    """
-    Update top-level path posterior q(u_t) using expected free energy G(u_t).
-
-    Args:
-        level_top: top-level LorenzLevel with B_paths, E_paths, num_paths > 0
-        level0: lowest-level LorenzLevel
-        qs1_grid: (T, H1, W1, S1) top-level state posteriors
-        qs0_grid: (T, H0, W0, S0) lowest-level state posteriors
-        C: (O,) preference distribution over lowest-level outcomes
-        gamma: precision over expected free energy
-
-    Returns:
-        qu_t: (T, U) posterior over paths at each time.
-    """
-    U = level_top.num_paths
-    B_paths = level_top.B_paths  # (U, U)
-    E_paths = level_top.E_paths  # (U,)
-
-    T = qs1_grid.shape[0]
-
-    # Compute G_tu
-    G_tu = compute_expected_free_energy_paths(
-        level_top,
-        level0,
-        qs1_grid,
-        qs0_grid,
-        C,
-        gamma=gamma,
-    )  # (T, U)
-
-    # Prior over u_t based on EFE: p(u_t) ∝ exp(-gamma * G_tu)
-    def prior_u_t(G_t: jnp.ndarray) -> jnp.ndarray:
-        logits = -gamma * G_t  # (U,)
-        return nn.softmax(logits, axis=-1)
-
-    p_u_t = jax.vmap(prior_u_t)(G_tu)  # (T, U)
-
-    # Now combine with B_paths (temporal coupling over u) in a simple VMP:
-    qu = jnp.full((T, U), 1.0 / U, dtype=jnp.float32)
-
-    def forward_messages(qu_):
-        msgs = []
-        prev_q = qu_[0]
-        msgs.append(jnp.log(jnp.clip(E_paths, 1e-16)))
-        for t in range(1, T):
-            msg = jnp.log(jnp.clip(B_paths @ prev_q, 1e-16))
-            msgs.append(msg)
-            prev_q = qu_[t]
-        return jnp.stack(msgs, axis=0)
-
-    def backward_messages(qu_):
-        msgs = []
-        next_q = qu_[-1]
-        msgs.append(jnp.zeros_like(next_q))
-        for t in range(T - 2, -1, -1):
-            msg = jnp.log(jnp.clip(B_paths.T @ next_q, 1e-16))
-            msgs.append(msg)
-            next_q = qu_[t]
-        msgs = msgs[::-1]
-        return jnp.stack(msgs, axis=0)
-
-    def update_once(qu_):
-        m_plus = forward_messages(qu_)
-        m_minus = backward_messages(qu_)
-        ln_qu = jnp.log(jnp.clip(p_u_t, 1e-16)) + m_plus + m_minus
-        return nn.softmax(ln_qu, axis=1)
-
-    def body_fun(_, qu_):
-        return update_once(qu_)
-
-    qu_final = jax.lax.fori_loop(0, 2, body_fun, qu)
-    return qu_final
-
-
-# -----------------------------------------------------------------------------
-# 5. High-level inference entry point
+# 4. High-level inference entry point with EFE-based paths
 # -----------------------------------------------------------------------------
 
 def infer_lorenz_hierarchy(
@@ -605,7 +419,8 @@ def infer_lorenz_hierarchy(
              level 0 and 1 (bottom-up + top-down).
       4. Build a preference distribution C over lowest-level outcomes.
       5. If the top level has a path factor, compute expected free energy
-         G(u_t) for each path and update q(u_t) via a softmax(-gamma * G).
+         G_tu for paths via lorenz_efe, and update q(u_t) using G and
+         B_paths/E_paths.
 
     Args:
         hierarchy: LorenzHierarchy instance
@@ -675,15 +490,21 @@ def infer_lorenz_hierarchy(
     top_idx = len(hierarchy.levels) - 1
     level_top = hierarchy.levels[top_idx]
     if level_top.num_paths > 0 and qs1_grid is not None:
-        # For now, we only consider the case where top_idx == 1
-        # and we use the mean over spatial sites as the top state chain for G.
-        qu_top = update_top_level_paths_via_efe(
+        # Compute G_tu via lorenz_efe
+        from .lorenz_efe import compute_expected_free_energy_paths, update_path_posterior_from_G
+
+        G_tu = compute_expected_free_energy_paths(
             level_top,
             level0,
             qs1_grid,
-            qs_levels[0],  # updated qs0_grid
+            qs_levels[0],  # updated lowest-level qs0_grid_h
             C,
+        )
+        qu_top = update_path_posterior_from_G(
+            level_top,
+            G_tu,
             gamma=efe_gamma,
+            num_iter=2,
         )
         qu_levels[top_idx] = qu_top
     else:
