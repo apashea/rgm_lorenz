@@ -3,32 +3,32 @@
 Variational message passing for the Lorenz hierarchy.
 
 This module provides:
-  - A JAX-friendly inference routine that updates posterior beliefs over
-    states at each spatial level in the LorenzHierarchy, given:
-      * lowest-level observations (quantized patch codes)
-      * current model parameters (A, B, D, E)
-  - Free-energy computation for diagnostics.
+  - Single-level VMP for the lowest (patch) level using A, B_states, E_states.
+  - Two-level state inference with spatial renormalization:
+      * bottom-up messages from level 0 to level 1 via D
+      * top-down messages from level 1 to level 0 via D
+  - Top-level path inference using expected free energy over paths.
 
-This is a Lorenz-specific instance of the RGM-style inference and is
-structured to be easily generalized to full RGM message passing later.
+Expected free energy G(u) for a path factor at the top level is computed
+in terms of:
+  - predicted future observations at the lowest level,
+  - preferences over observations,
+  - epistemic (information gain) terms, in a simplified but RGM-aligned form.
 """
 
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
 
 import jax
 import jax.numpy as jnp
 from jax import nn
 
 from .lorenz_model import LorenzHierarchy, LorenzLevel
-from .lorenz_data import encode_quantized_coeffs
-from . import maths as rgm_maths  # assume we adapt pymdp.maths to rgm.maths
-
-# If you keep pymdp.jax.maths as a reference, you can temporarily import from there:
-# from pymdp.jax.maths import compute_log_likelihood_single_modality as compute_ll_single
+from .lorenz_data import build_lorenz_patch_dataset
+from . import maths as rgm_maths  # adapted from pymdp.jax.maths
 
 
 # -----------------------------------------------------------------------------
-# 1. Utilities: observations and A-dependencies for lowest level
+# 1. Utilities: observations and preferences for lowest level
 # -----------------------------------------------------------------------------
 
 def build_lowest_level_observations(
@@ -37,12 +37,12 @@ def build_lowest_level_observations(
     """
     Build an observation array suitable for lowest-level inference.
 
-    For now, we treat the quantized coefficients as "observations" in a
-    one-hot form that is consistent with the A built in lorenz_model.py.
+    We treat the quantized coefficients as "observations" in a one-hot form
+    that is consistent with the A built in lorenz_model.py.
 
     Returns:
-        obs: (T * H_blocks * W_blocks, O) array, where O = K * L,
-             each row is a one-hot (or distribution) over O.
+        obs: (N, O) array, where N = T * H_blocks * W_blocks,
+             O = K * L; each row is a one-hot (or distribution) over O.
     """
     q_coeffs = lorenz_data_dict["q_coeffs"]  # (N, K)
     K = int(lorenz_data_dict["K"])
@@ -50,7 +50,6 @@ def build_lowest_level_observations(
     N = q_coeffs.shape[0]
     O = K * L
 
-    # Same encoding scheme as build_lowest_level_A
     indices = (
         jnp.arange(K, dtype=jnp.int32)[None, :] * L + q_coeffs
     )  # (N, K)
@@ -66,11 +65,40 @@ def build_lowest_level_observations(
     return obs  # (N, O)
 
 
+def build_preference_distribution_lowest(
+    O: int,
+    mode: str = "data_empirical",
+    obs: Optional[jnp.ndarray] = None,
+) -> jnp.ndarray:
+    """
+    Build a preference distribution C over lowest-level outcomes (O-dim).
+
+    Args:
+        O: outcome dimension at lowest level (O = K * L)
+        mode: how to set preferences:
+              - "uniform": no particular preferred outcome
+              - "data_empirical": empirical distribution over training obs
+        obs: (N, O) one-hot/distribution observations (required for empirical)
+
+    Returns:
+        C: (O,) preference distribution
+    """
+    if mode == "uniform" or obs is None:
+        C = jnp.ones((O,), dtype=jnp.float32)
+        C = C / C.sum()
+        return C
+
+    # empirical distribution
+    C = obs.mean(axis=0)
+    C = C / (C.sum() + 1e-8)
+    return C
+
+
 # -----------------------------------------------------------------------------
-# 2. Single-level VMP using A and B (no spatial coupling yet)
+# 2. Single-level VMP using A and B (no spatial coupling)
 # -----------------------------------------------------------------------------
 
-def vmp_single_level(
+def vmp_single_chain(
     A: jnp.ndarray,
     B: jnp.ndarray,
     E: jnp.ndarray,
@@ -79,33 +107,26 @@ def vmp_single_level(
 ) -> Tuple[jnp.ndarray, float]:
     """
     Variational message passing for a single chain of hidden states with:
-      - emission model A (shared across time)
-      - transition model B(s'|s)
-      - prior over initial state E
-
-    This is a simplified version of pymdp.jax.algos.run_vmp specialized
-    to a 1D chain with one hidden factor and one observation modality.
+      - emission model A (shared across time),
+      - transition model B(s'|s),
+      - prior over initial state E.
 
     Args:
         A: (S, O) emission matrix P(o|s)
         B: (S, S) transition matrix P(s'|s)
         E: (S,) prior over s_0
-        obs: (T, O) observations as one-hot/distributions over O
+        obs: (T, O) observations (one-hot / distribution over O)
         num_iter: number of VMP iterations
 
     Returns:
         qs: (T, S) posterior marginals over states
-        F: scalar free energy (approximation)
+        F: scalar free energy (approximate, observation-only)
     """
     T = obs.shape[0]
     S = A.shape[0]
 
     # Precompute log-likelihoods ln P(o_t | s_t) for all t, s
-    # likelihood_t[s] = sum_o obs[t, o] * A[s, o]
-    # log_likelihoods: (T, S)
     def likelihood_single(o_t: jnp.ndarray) -> jnp.ndarray:
-        # o_t: (O,)
-        # A: (S, O)
         lik = (o_t[None, :] * A).sum(axis=1)  # (S,)
         return jnp.log(jnp.clip(lik, a_min=1e-16))
 
@@ -114,21 +135,8 @@ def vmp_single_level(
     # Initialize q(s_t) ~ uniform
     qs = jnp.full((T, S), 1.0 / S, dtype=jnp.float32)
     ln_prior = jnp.log(jnp.clip(E, 1e-16))
-    ln_B = jnp.log(jnp.clip(B, 1e-16))
 
     def forward_messages(qs_: jnp.ndarray) -> jnp.ndarray:
-        """
-        Compute forward messages m_+(s_t) using B and prior.
-        m_+(s_0) = ln_prior
-        m_+(s_t) = ln sum_s' [ q(s'_{t-1}) * B(s_t | s'_{t-1}) ]
-        """
-        def step(carry, t):
-            prev_q = carry  # (S,)
-            # message to time t: log(B @ prev_q)
-            msg = jnp.log(jnp.clip(B @ prev_q, 1e-16))
-            return qs_[t], msg
-
-        # First message is prior at t=0
         msgs = []
         prev_q = qs_[0]
         msgs.append(ln_prior)
@@ -136,14 +144,9 @@ def vmp_single_level(
             msg = jnp.log(jnp.clip(B @ prev_q, 1e-16))
             msgs.append(msg)
             prev_q = qs_[t]
-        return jnp.stack(msgs, axis=0)  # (T, S)
+        return jnp.stack(msgs, axis=0)
 
     def backward_messages(qs_: jnp.ndarray) -> jnp.ndarray:
-        """
-        Compute backward messages m_-(s_t) using B.
-        m_-(s_T) = 0
-        m_-(s_t) = ln sum_s' [ B(s' | s_t) * q(s'_{t+1}) ]
-        """
         msgs = []
         next_q = qs_[-1]
         msgs.append(jnp.zeros_like(next_q))
@@ -152,63 +155,473 @@ def vmp_single_level(
             msgs.append(msg)
             next_q = qs_[t]
         msgs = msgs[::-1]
-        return jnp.stack(msgs, axis=0)  # (T, S)
+        return jnp.stack(msgs, axis=0)
 
     def vmp_iteration(qs_):
-        m_plus = forward_messages(qs_)   # (T, S)
-        m_minus = backward_messages(qs_) # (T, S)
+        m_plus = forward_messages(qs_)
+        m_minus = backward_messages(qs_)
         ln_qs = log_liks + m_plus + m_minus
-        qs_next = nn.softmax(ln_qs, axis=1)
-        return qs_next
+        return nn.softmax(ln_qs, axis=1)
 
-    def body_fun(i, qs_):
+    def body_fun(_, qs_):
         return vmp_iteration(qs_)
 
     qs = jax.lax.fori_loop(0, num_iter, body_fun, qs)
 
-    # Free energy (simple approximation) using pymdp-style helper
-    # We treat obs as one-hot distributions; A as emission model; prior as E.
-    # Package obs into the "modality" format expected by compute_free_energy.
-    obs_list = [obs]  # single modality
+    # Observation-only free energy (for diagnostics)
+    obs_list = [obs]
     A_list = [A]
-    qs_list = [qs_t for qs_t in qs.T]  # treat each state as factor? simple hack
-
-    # For now, we just compute a crude free energy ignoring transitions,
-    # as a diagnostic. A full chain-based F would include transition terms.
+    qs_list = [qs.mean(axis=0)]  # crude aggregation
     F = rgm_maths.compute_free_energy(qs_list, [E], obs_list, A_list)
 
     return qs, F
 
 
 # -----------------------------------------------------------------------------
-# 3. Multi-level Lorenz inference stub
+# 3. Two-level hierarchical state inference via D
 # -----------------------------------------------------------------------------
 
-def infer_lorenz_states(
+def bottom_up_message_level0_to_level1(
+    qs0_grid: jnp.ndarray,
+    D1: jnp.ndarray,
+    states_grid1: jnp.ndarray,
+) -> jnp.ndarray:
+    """
+    Compute a simple bottom-up "pseudo-likelihood" for each Level-1 state
+    from Level-0 posterior beliefs and the deterministic D mapping.
+
+    Args:
+        qs0_grid: (T, H0, W0, S0) posterior over Level-0 states per patch.
+        D1: (S1, child_config_dim=4) array of child state patterns.
+        states_grid1: (T, H1, W1) integer states for Level-1 (used for layout).
+
+    Returns:
+        log_lik1: (T, H1, W1, S1) log "likelihood" contributions at Level 1.
+    """
+    T, H0, W0, S0 = qs0_grid.shape
+    T1, H1, W1 = states_grid1.shape
+    assert T == T1
+    assert H0 == 2 * H1 and W0 == 2 * W1
+
+    S1 = D1.shape[0]
+
+    def site_children(qs0_t: jnp.ndarray) -> jnp.ndarray:
+        c00 = qs0_t[0::2, 0::2, :]
+        c01 = qs0_t[0::2, 1::2, :]
+        c10 = qs0_t[1::2, 0::2, :]
+        c11 = qs0_t[1::2, 1::2, :]
+        return jnp.stack([c00, c01, c10, c11], axis=2)  # (H1, W1, 4, S0)
+
+    qs0_children = jax.vmap(site_children)(qs0_grid)  # (T, H1, W1, 4, S0)
+    D1_indices = D1.astype(jnp.int32)  # (S1, 4)
+
+    def score_parent_state(qs0_child: jnp.ndarray, pattern: jnp.ndarray) -> jnp.ndarray:
+        probs = qs0_child[jnp.arange(4), pattern]  # (4,)
+        log_probs = jnp.log(jnp.clip(probs, 1e-16))
+        return log_probs.sum()
+
+    def score_all_parents_for_site(qs0_child_site: jnp.ndarray) -> jnp.ndarray:
+        return jax.vmap(lambda pattern: score_parent_state(qs0_child_site, pattern))(D1_indices)
+
+    def score_all_sites(qs0_children_t: jnp.ndarray) -> jnp.ndarray:
+        def score_site(children_site: jnp.ndarray) -> jnp.ndarray:
+            return score_all_parents_for_site(children_site)
+        return jax.vmap(jax.vmap(score_site, in_axes=0), in_axes=0)(qs0_children_t)
+
+    log_lik1 = jax.vmap(score_all_sites)(qs0_children)  # (T, H1, W1, S1)
+    return log_lik1
+
+
+def vmp_two_level_states(
+    level0: LorenzLevel,
+    level1: LorenzLevel,
+    qs0_grid: jnp.ndarray,
+    states_grid1: jnp.ndarray,
+    num_iter: int = 4,
+) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """
+    Perform a simple coupled VMP over Level-0 and Level-1 states.
+
+    See previous version for detailed comments; this function is unchanged
+    from the prior step except for minor refactoring.
+    """
+    A0 = level0.A
+    B0 = level0.B_states
+    E0 = level0.E_states
+
+    B1 = level1.B_states
+    E1 = level1.E_states
+    D1 = level1.D
+
+    T, H0, W0, S0 = qs0_grid.shape
+    T1, H1, W1 = states_grid1.shape
+    assert T == T1
+    assert H0 == 2 * H1 and W0 == 2 * W1
+
+    S1 = int(B1.shape[0])
+    qs1_grid = jnp.full((T, H1, W1, S1), 1.0 / S1, dtype=jnp.float32)
+
+    def update_level1(qs0_grid_current: jnp.ndarray,
+                      qs1_grid_current: jnp.ndarray) -> jnp.ndarray:
+        log_lik1 = bottom_up_message_level0_to_level1(qs0_grid_current, D1, states_grid1)
+
+        def update_site(qs1_site: jnp.ndarray,
+                        log_lik1_site: jnp.ndarray) -> jnp.ndarray:
+            def fwd_bwd(qs_):
+                def forward_messages(qs_):
+                    msgs = []
+                    prev_q = qs_[0]
+                    msgs.append(jnp.log(jnp.clip(E1, 1e-16)))
+                    for t in range(1, T):
+                        msg = jnp.log(jnp.clip(B1 @ prev_q, 1e-16))
+                        msgs.append(msg)
+                        prev_q = qs_[t]
+                    return jnp.stack(msgs, axis=0)
+
+                def backward_messages(qs_):
+                    msgs = []
+                    next_q = qs_[-1]
+                    msgs.append(jnp.zeros_like(next_q))
+                    for t in range(T - 2, -1, -1):
+                        msg = jnp.log(jnp.clip(B1.T @ next_q, 1e-16))
+                        msgs.append(msg)
+                        next_q = qs_[t]
+                    msgs = msgs[::-1]
+                    return jnp.stack(msgs, axis=0)
+
+                m_plus = forward_messages(qs_)
+                m_minus = backward_messages(qs_)
+                ln_qs = log_lik1_site + m_plus + m_minus
+                return nn.softmax(ln_qs, axis=1)
+
+            def body_fun(_, qs_):
+                return fwd_bwd(qs_)
+
+            return jax.lax.fori_loop(0, 2, body_fun, qs1_site)
+
+        qs1_grid_new = jax.vmap(
+            jax.vmap(update_site, in_axes=(0, 0)),
+            in_axes=(0, 0)
+        )(qs1_grid_current, log_lik1)
+
+        return qs1_grid_new
+
+    def update_level0(qs0_grid_current: jnp.ndarray,
+                      qs1_grid_current: jnp.ndarray) -> jnp.ndarray:
+        H1, W1 = qs1_grid_current.shape[1], qs1_grid_current.shape[2]
+
+        def build_topdown_prior() -> jnp.ndarray:
+            def bias_for_time(t):
+                qs1_t = qs1_grid_current[t]  # (H1, W1, S1)
+                bias = jnp.zeros((H0, W0, S0), dtype=jnp.float32)
+
+                for h1 in range(H1):
+                    for w1 in range(W1):
+                        qs1_hw = qs1_t[h1, w1]  # (S1,)
+                        for child_idx, (dh, dw) in enumerate([(0, 0), (0, 1), (1, 0), (1, 1)]):
+                            h0 = 2 * h1 + dh
+                            w0 = 2 * w1 + dw
+                            child_states = D1[:, child_idx]  # (S1,)
+                            accum = jnp.zeros((S0,), dtype=jnp.float32)
+                            def body_fun(s1, acc):
+                                s0_pref = child_states[s1]
+                                return acc.at[s0_pref].add(qs1_hw[s1])
+                            accum = jax.lax.fori_loop(0, S1, body_fun, accum)
+                            accum = accum / (accum.sum() + 1e-8)
+                            log_accum = jnp.log(jnp.clip(accum, 1e-16))
+                            bias = bias.at[h0, w0, :].set(log_accum)
+                return bias
+
+            return jax.vmap(bias_for_time)(jnp.arange(T))
+
+        log_prior_bias0 = build_topdown_prior()
+
+        def update_site(qs0_site: jnp.ndarray,
+                        log_bias_site: jnp.ndarray) -> jnp.ndarray:
+            def fwd_bwd(qs_):
+                def forward_messages(qs_):
+                    msgs = []
+                    prev_q = qs_[0]
+                    msgs.append(jnp.log(jnp.clip(E0, 1e-16)))
+                    for t in range(1, T):
+                        msg = jnp.log(jnp.clip(B0 @ prev_q, 1e-16))
+                        msgs.append(msg)
+                        prev_q = qs_[t]
+                    return jnp.stack(msgs, axis=0)
+
+                def backward_messages(qs_):
+                    msgs = []
+                    next_q = qs_[-1]
+                    msgs.append(jnp.zeros_like(next_q))
+                    for t in range(T - 2, -1, -1):
+                        msg = jnp.log(jnp.clip(B0.T @ next_q, 1e-16))
+                        msgs.append(msg)
+                        next_q = qs_[t]
+                    msgs = msgs[::-1]
+                    return jnp.stack(msgs, axis=0)
+
+                m_plus = forward_messages(qs_)
+                m_minus = backward_messages(qs_)
+                ln_qs = log_bias_site + m_plus + m_minus
+                return nn.softmax(ln_qs, axis=1)
+
+            def body_fun(_, qs_):
+                return fwd_bwd(qs_)
+
+            return jax.lax.fori_loop(0, 1, body_fun, qs0_site)
+
+        qs0_grid_new = jax.vmap(
+            jax.vmap(update_site, in_axes=(0, 0)),
+            in_axes=(0, 0)
+        )(qs0_grid_current, log_prior_bias0)
+
+        return qs0_grid_new
+
+    qs0_current = qs0_grid
+    qs1_current = qs1_grid
+
+    def alt_step(_, carry):
+        qs0_c, qs1_c = carry
+        qs1_new = update_level1(qs0_c, qs1_c)
+        qs0_new = update_level0(qs0_c, qs1_new)
+        return (qs0_new, qs1_new)
+
+    qs0_final, qs1_final = jax.lax.fori_loop(0, num_iter, alt_step, (qs0_current, qs1_current))
+
+    return qs0_final, qs1_final
+
+
+# -----------------------------------------------------------------------------
+# 4. Expected free energy for top-level paths
+# -----------------------------------------------------------------------------
+
+def compute_expected_obs_lowest(
+    qs0_grid: jnp.ndarray,
+    level0: LorenzLevel,
+) -> jnp.ndarray:
+    """
+    Compute predicted observation distribution at the lowest level
+    given posterior over lowest-level states.
+
+    Args:
+        qs0_grid: (T, H0, W0, S0)
+        level0: LorenzLevel with A (S0, O)
+
+    Returns:
+        qo_t: (T, O) predicted observation distributions averaged over space.
+    """
+    A0 = level0.A  # (S0, O)
+    T, H0, W0, S0 = qs0_grid.shape
+    O = A0.shape[1]
+
+    # For each time, average qs0 over spatial sites, then multiply by A0.
+    def pred_obs_t(qs0_t: jnp.ndarray) -> jnp.ndarray:
+        # qs0_t: (H0, W0, S0)
+        qs_mean = qs0_t.mean(axis=(0, 1))  # (S0,)
+        qo = qs_mean @ A0  # (O,)
+        qo = qo / (qo.sum() + 1e-8)
+        return qo
+
+    qo_t = jax.vmap(pred_obs_t)(qs0_grid)  # (T, O)
+    return qo_t
+
+
+def compute_expected_free_energy_paths(
+    level_top: LorenzLevel,
+    level0: LorenzLevel,
+    qs1_grid: jnp.ndarray,
+    qs0_grid: jnp.ndarray,
+    C: jnp.ndarray,
+    gamma: float = 16.0,
+) -> jnp.ndarray:
+    """
+    Compute expected free energy G(u_t) for paths at the top level.
+
+    Simplifications:
+      - We assume a path factor u_t at the top level that modulates state
+        transitions at level 1 (not yet explicitly in B1), but here we use
+        a coarse approximation:
+          * expected observations are derived from current qs0_grid,
+            independent of u (since we have not yet encoded B(s'|s,u)).
+          * risk term: expected negative log preference under C.
+          * epistemic term: a simple state-entropy reduction proxy.
+
+    Args:
+        level_top: top-level LorenzLevel (with num_paths > 0)
+        level0: lowest-level LorenzLevel (for A)
+        qs1_grid: (T, H1, W1, S1) top-level state posteriors
+        qs0_grid: (T, H0, W0, S0) lowest-level state posteriors
+        C: (O,) preference distribution over lowest-level outcomes
+        gamma: precision over expected free energy (for later softmax)
+
+    Returns:
+        G_tu: (T, U) expected free energy per time and path (simplified)
+    """
+    U = level_top.num_paths
+    if U == 0:
+        return None
+
+    T = qs1_grid.shape[0]
+    A0 = level0.A
+    O = A0.shape[1]
+
+    # Predicted obs from qs0 (same for all u in this simplified version)
+    qo_t = compute_expected_obs_lowest(qs0_grid, level0)  # (T, O)
+
+    # Risk term: expected negative log preference
+    log_C = jnp.log(jnp.clip(C, 1e-16))
+
+    def risk_t(qo: jnp.ndarray) -> float:
+        # E_qo[-log C(o)]
+        return -(qo * log_C).sum()
+
+    risk_vec = jax.vmap(risk_t)(qo_t)  # (T,)
+
+    # Epistemic term (very simplified): encourage states with high entropy
+    # reduction – here we just use negative entropy of qs1 as proxy.
+    def epistemic_t(qs1_t: jnp.ndarray) -> float:
+        # qs1_t: (H1, W1, S1)
+        # Average entropy across sites
+        def ent_site(qs_site: jnp.ndarray) -> float:
+            return - (qs_site * jnp.log(jnp.clip(qs_site, 1e-16))).sum()
+        ent_sites = jax.vmap(jax.vmap(ent_site))(qs1_t)
+        ent_mean = ent_sites.mean()
+        # epistemic term ~ -entropy (prefer more certainty / info gain)
+        return -ent_mean
+
+    epistemic_vec = jax.vmap(epistemic_t)(qs1_grid)  # (T,)
+
+    # Combine terms into G_t; in this simplified version, G does not depend on u
+    G_t = risk_vec + epistemic_vec  # (T,)
+
+    # Broadcast to U paths; later, when B(s'|s,u) is explicit, G will differ by u
+    G_tu = jnp.broadcast_to(G_t[:, None], (T, U))  # (T, U)
+
+    return G_tu
+
+
+def update_top_level_paths_via_efe(
+    level_top: LorenzLevel,
+    level0: LorenzLevel,
+    qs1_grid: jnp.ndarray,
+    qs0_grid: jnp.ndarray,
+    C: jnp.ndarray,
+    gamma: float = 16.0,
+) -> jnp.ndarray:
+    """
+    Update top-level path posterior q(u_t) using expected free energy G(u_t).
+
+    Args:
+        level_top: top-level LorenzLevel with B_paths, E_paths, num_paths > 0
+        level0: lowest-level LorenzLevel
+        qs1_grid: (T, H1, W1, S1) top-level state posteriors
+        qs0_grid: (T, H0, W0, S0) lowest-level state posteriors
+        C: (O,) preference distribution over lowest-level outcomes
+        gamma: precision over expected free energy
+
+    Returns:
+        qu_t: (T, U) posterior over paths at each time.
+    """
+    U = level_top.num_paths
+    B_paths = level_top.B_paths  # (U, U)
+    E_paths = level_top.E_paths  # (U,)
+
+    T = qs1_grid.shape[0]
+
+    # Compute G_tu
+    G_tu = compute_expected_free_energy_paths(
+        level_top,
+        level0,
+        qs1_grid,
+        qs0_grid,
+        C,
+        gamma=gamma,
+    )  # (T, U)
+
+    # Prior over u_t based on EFE: p(u_t) ∝ exp(-gamma * G_tu)
+    def prior_u_t(G_t: jnp.ndarray) -> jnp.ndarray:
+        logits = -gamma * G_t  # (U,)
+        return nn.softmax(logits, axis=-1)
+
+    p_u_t = jax.vmap(prior_u_t)(G_tu)  # (T, U)
+
+    # Now combine with B_paths (temporal coupling over u) in a simple VMP:
+    qu = jnp.full((T, U), 1.0 / U, dtype=jnp.float32)
+
+    def forward_messages(qu_):
+        msgs = []
+        prev_q = qu_[0]
+        msgs.append(jnp.log(jnp.clip(E_paths, 1e-16)))
+        for t in range(1, T):
+            msg = jnp.log(jnp.clip(B_paths @ prev_q, 1e-16))
+            msgs.append(msg)
+            prev_q = qu_[t]
+        return jnp.stack(msgs, axis=0)
+
+    def backward_messages(qu_):
+        msgs = []
+        next_q = qu_[-1]
+        msgs.append(jnp.zeros_like(next_q))
+        for t in range(T - 2, -1, -1):
+            msg = jnp.log(jnp.clip(B_paths.T @ next_q, 1e-16))
+            msgs.append(msg)
+            next_q = qu_[t]
+        msgs = msgs[::-1]
+        return jnp.stack(msgs, axis=0)
+
+    def update_once(qu_):
+        m_plus = forward_messages(qu_)
+        m_minus = backward_messages(qu_)
+        ln_qu = jnp.log(jnp.clip(p_u_t, 1e-16)) + m_plus + m_minus
+        return nn.softmax(ln_qu, axis=1)
+
+    def body_fun(_, qu_):
+        return update_once(qu_)
+
+    qu_final = jax.lax.fori_loop(0, 2, body_fun, qu)
+    return qu_final
+
+
+# -----------------------------------------------------------------------------
+# 5. High-level inference entry point
+# -----------------------------------------------------------------------------
+
+def infer_lorenz_hierarchy(
     hierarchy: LorenzHierarchy,
     lorenz_data_dict: Dict[str, Any],
-    num_iter: int = 8,
+    num_iter_lowest: int = 8,
+    num_iter_hier: int = 4,
+    efe_gamma: float = 16.0,
+    pref_mode: str = "data_empirical",
 ) -> Dict[str, Any]:
     """
-    Run variational inference over states in the Lorenz hierarchy.
+    Run variational inference over states and paths in the Lorenz hierarchy.
 
-    Current simplifications:
-      - We infer posteriors only at the lowest level using A and B,
-        ignoring top-down influences from higher levels.
-      - Higher levels are kept as placeholders; later we will add
-        messages from D and possibly path factors.
+    Steps:
+      1. Infer level-0 states over the patch sequence using A0, B0, E0.
+      2. Reshape to (T, H0, W0, S0).
+      3. If a higher level exists:
+           - Run two-level hierarchical state inference using D between
+             level 0 and 1 (bottom-up + top-down).
+      4. Build a preference distribution C over lowest-level outcomes.
+      5. If the top level has a path factor, compute expected free energy
+         G(u_t) for each path and update q(u_t) via a softmax(-gamma * G).
 
     Args:
         hierarchy: LorenzHierarchy instance
-        lorenz_data_dict: output of build_lorenz_patch_dataset (for obs)
-        num_iter: number of VMP iterations
+        lorenz_data_dict: output of build_lorenz_patch_dataset
+        num_iter_lowest: iterations for lowest-level chain VMP
+        num_iter_hier: iterations for hierarchical alternating updates
+        efe_gamma: precision over expected free energy for paths
+        pref_mode: "uniform" or "data_empirical" for preferences over outcomes
 
     Returns:
-        results dict with:
+        dict with:
           'qs_levels': list of posterior arrays per level:
-               level 0: (T*H*W, S0) or (T, H, W, S0)
-               higher levels: None for now
-          'F_levels': list of free energies per level (level 0 only)
+               level 0: (T, H0, W0, S0)
+               level 1: (T, H1, W1, S1) if exists
+          'qu_levels': list with path posteriors or None per level
+          'F_lowest': free energy at lowest level (observation-only approximation)
     """
     T = hierarchy.T
     H0 = hierarchy.H_blocks
@@ -216,31 +629,69 @@ def infer_lorenz_states(
 
     # Level 0 model
     level0: LorenzLevel = hierarchy.levels[0]
-    A0 = level0.A     # (S0, O)
-    B0 = level0.B_states  # (S0, S0)
-    E0 = level0.E_states  # (S0,)
+    A0 = level0.A
+    B0 = level0.B_states
+    E0 = level0.E_states
 
     # Observations for level 0
     obs_flat = build_lowest_level_observations(lorenz_data_dict)  # (N, O)
     N = obs_flat.shape[0]
     S0 = A0.shape[0]
+    O = A0.shape[1]
+    assert N == T * H0 * W0, "Observation length mismatch."
 
-    # For now we treat the entire patch set as one long chain of length N.
-    qs0, F0 = vmp_single_level(A0, B0, E0, obs_flat, num_iter=num_iter)
+    # Preferences over outcomes at lowest level
+    C = build_preference_distribution_lowest(O, mode=pref_mode, obs=obs_flat)
 
-    # Optionally reshape qs0 to (T, H0, W0, S0)
-    qs0_grid = qs0.reshape(T, H0, W0, S0)
+    # 1. Infer Level-0 states for the whole patch sequence
+    qs0_flat, F0 = vmp_single_chain(A0, B0, E0, obs_flat, num_iter=num_iter_lowest)
 
-    # Higher levels: placeholders for now
-    num_levels = len(hierarchy.levels)
-    qs_levels: List[Any] = [qs0_grid]
-    F_levels: List[Any] = [F0]
+    # Reshape to (T, H0, W0, S0)
+    qs0_grid = qs0_flat.reshape(T, H0, W0, S0)
 
-    for l in range(1, num_levels):
-        qs_levels.append(None)
-        F_levels.append(None)
+    qs_levels: List[Optional[jnp.ndarray]] = [qs0_grid]
+    qu_levels: List[Optional[jnp.ndarray]] = [None]
+
+    qs1_grid = None
+
+    # 2. Hierarchical inference if there is at least one higher level
+    if len(hierarchy.levels) > 1:
+        level1: LorenzLevel = hierarchy.levels[1]
+        states_grid1 = hierarchy.states_grids[1]  # (T, H1, W1)
+
+        qs0_grid_h, qs1_grid = vmp_two_level_states(
+            level0,
+            level1,
+            qs0_grid,
+            states_grid1,
+            num_iter=num_iter_hier,
+        )
+
+        qs_levels[0] = qs0_grid_h
+        qs_levels.append(qs1_grid)
+        qu_levels.append(None)
+
+    # 3. Top-level path factor with EFE
+    top_idx = len(hierarchy.levels) - 1
+    level_top = hierarchy.levels[top_idx]
+    if level_top.num_paths > 0 and qs1_grid is not None:
+        # For now, we only consider the case where top_idx == 1
+        # and we use the mean over spatial sites as the top state chain for G.
+        qu_top = update_top_level_paths_via_efe(
+            level_top,
+            level0,
+            qs1_grid,
+            qs_levels[0],  # updated qs0_grid
+            C,
+            gamma=efe_gamma,
+        )
+        qu_levels[top_idx] = qu_top
+    else:
+        if len(qu_levels) < len(hierarchy.levels):
+            qu_levels += [None] * (len(hierarchy.levels) - len(qu_levels))
 
     return {
         "qs_levels": qs_levels,
-        "F_levels": F_levels,
+        "qu_levels": qu_levels,
+        "F_lowest": F0,
     }
