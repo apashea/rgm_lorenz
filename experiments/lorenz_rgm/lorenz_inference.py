@@ -15,6 +15,7 @@ This module provides:
 This is a Lorenz-specific instance of RGM-style inference and is structured
 to be extended further for full RGM behaviour.
 """
+import numpy as np
 
 from typing import List, Dict, Any, Tuple, Optional
 
