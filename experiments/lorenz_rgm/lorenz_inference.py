@@ -4,8 +4,8 @@ Variational message passing for the Lorenz hierarchy.
 
 This module provides:
   - Single-chain VMP for the lowest (patch) level using A, B_states, E_states.
-  - Patch-wise lowest-level inference by vmapping the single-chain VMP over
-    all spatial patches (H0, W0).
+  - Patch-wise lowest-level inference by looping over patches and calling
+    the single-chain VMP (to keep memory usage manageable).
   - Two-level state inference with spatial renormalization:
       * bottom-up messages from level 0 to level 1 via D
       * top-down messages from level 1 to level 0 via D
@@ -15,16 +15,15 @@ This module provides:
 This is a Lorenz-specific instance of RGM-style inference and is structured
 to be extended further for full RGM behaviour.
 """
-import numpy as np
 
 from typing import List, Dict, Any, Tuple, Optional
 
+import numpy as np
 import jax
 import jax.numpy as jnp
 from jax import nn
 
 from .lorenz_model import LorenzHierarchy, LorenzLevel
-from . import maths as rgm_maths  # adapted from pymdp.jax.maths
 from .lorenz_efe import (
     compute_expected_free_energy_paths,
     update_path_posterior_from_G,
@@ -119,7 +118,7 @@ def build_preference_distribution_lowest(
 
 
 # -----------------------------------------------------------------------------
-# 2. Single-chain VMP using A and B (no spatial coupling)
+# 2. Single-chain VMP using A and B (no spatial coupling, no F)
 # -----------------------------------------------------------------------------
 
 def vmp_single_chain(
@@ -128,7 +127,7 @@ def vmp_single_chain(
     E: jnp.ndarray,
     obs: jnp.ndarray,
     num_iter: int = 8,
-) -> Tuple[jnp.ndarray, float]:
+) -> jnp.ndarray:
     """
     Variational message passing for a single chain of hidden states with:
       - emission model A (shared across time),
@@ -144,7 +143,6 @@ def vmp_single_chain(
 
     Returns:
         qs: (T, S) posterior marginals over states
-        F: scalar free energy (approximate, observation-only)
     """
     T = obs.shape[0]
     S = A.shape[0]
@@ -192,24 +190,18 @@ def vmp_single_chain(
 
     qs = jax.lax.fori_loop(0, num_iter, body_fun, qs)
 
-    # Observation-only free energy (for diagnostics, using a single-chain view)
-    obs_list = [obs]
-    A_list = [A]
-    qs_list = [qs.mean(axis=0)]  # crude aggregation
-    F = rgm_maths.compute_free_energy(qs_list, [E], obs_list, A_list)
-
-    return qs, F
+    return qs
 
 
 # -----------------------------------------------------------------------------
-# 3. Patch-wise lowest-level inference (vmapped chains)
+# 3. Patch-wise lowest-level inference (loop over patches)
 # -----------------------------------------------------------------------------
 
 def infer_lowest_level_patches(
     level0: LorenzLevel,
     lorenz_data_dict: Dict[str, Any],
     num_iter_lowest: int = 8,
-) -> Tuple[jnp.ndarray, float]:
+) -> jnp.ndarray:
     """
     Run VMP at the lowest level independently for each patch, using a
     Python loop over (h0, w0) to keep memory usage manageable.
@@ -225,7 +217,6 @@ def infer_lowest_level_patches(
 
     Returns:
         qs0_grid: (T, H0, W0, S0) posterior over lowest-level states
-        F_avg: average free energy across patches (diagnostic)
     """
     A0 = level0.A        # (S0, O)
     B0 = level0.B_states # (S0, S0)
@@ -235,26 +226,18 @@ def infer_lowest_level_patches(
     T, H0, W0, O = obs_grid.shape
     S0 = A0.shape[0]
 
-    # Jitted single-chain inference
     vmp_single_chain_jit = jax.jit(vmp_single_chain, static_argnames=("num_iter",))
 
-    # We'll accumulate results in host (NumPy) arrays to avoid excessive device memory
     qs0_host = np.zeros((T, H0, W0, S0), dtype=np.float32)
-    F_sum = 0.0
-    num_patches = H0 * W0
 
     for h0 in range(H0):
         for w0 in range(W0):
             obs_patch = obs_grid[:, h0, w0, :]         # (T, O)
-            qs_chain, F_chain = vmp_single_chain_jit(A0, B0, E0, obs_patch, num_iter=num_iter_lowest)
-            qs_chain_host = np.array(qs_chain)         # move to host
-            qs0_host[:, h0, w0, :] = qs_chain_host
-            F_sum += float(F_chain)
+            qs_chain = vmp_single_chain_jit(A0, B0, E0, obs_patch, num_iter=num_iter_lowest)
+            qs0_host[:, h0, w0, :] = np.array(qs_chain)
 
-    qs0_grid = jnp.array(qs0_host)          # back to device
-    F_avg = F_sum / float(num_patches)
-
-    return qs0_grid, F_avg
+    qs0_grid = jnp.array(qs0_host)
+    return qs0_grid
 
 
 # -----------------------------------------------------------------------------
@@ -515,7 +498,6 @@ def infer_lorenz_hierarchy(
                level 0: (T, H0, W0, S0)
                level 1: (T, H1, W1, S1) if exists
           'qu_levels': list with path posteriors or None per level
-          'F_lowest': average free energy at lowest level (observation-only approximation)
     """
     T = hierarchy.T
     H0 = hierarchy.H_blocks
@@ -524,7 +506,6 @@ def infer_lorenz_hierarchy(
     # Level 0 model
     level0: LorenzLevel = hierarchy.levels[0]
     A0 = level0.A
-    S0 = A0.shape[0]
     O = A0.shape[1]
 
     # Observations for level 0 (flat) for preferences
@@ -536,8 +517,8 @@ def infer_lorenz_hierarchy(
     C = build_preference_distribution_lowest(O, mode=pref_mode, obs_flat=obs_flat)
 
     # 1. Infer Level-0 states patch-wise
-    qs0_grid, F0_avg = infer_lowest_level_patches(level0, lorenz_data_dict,
-                                                  num_iter_lowest=num_iter_lowest)
+    qs0_grid = infer_lowest_level_patches(level0, lorenz_data_dict,
+                                          num_iter_lowest=num_iter_lowest)
 
     qs_levels: List[Optional[jnp.ndarray]] = [qs0_grid]
     qu_levels: List[Optional[jnp.ndarray]] = [None]
@@ -586,5 +567,4 @@ def infer_lorenz_hierarchy(
     return {
         "qs_levels": qs_levels,
         "qu_levels": qu_levels,
-        "F_lowest": F0_avg,
     }
