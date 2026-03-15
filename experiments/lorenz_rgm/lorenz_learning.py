@@ -20,7 +20,7 @@ It assumes:
   - Inference over states and paths is provided by lorenz_inference.py.
 """
 
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Tuple, Optional
 
 import jax
 import jax.numpy as jnp
