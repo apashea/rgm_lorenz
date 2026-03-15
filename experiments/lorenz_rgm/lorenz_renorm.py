@@ -9,7 +9,7 @@ This module:
 4. Builds a D tensor encoding the deterministic mapping from parent states
    to child configurations, with:
      - no shared children between different groups
-     - unique child patterns (columns) for each parent state
+     - unique child patterns (rows) for each parent state
 5. Supports recursive application to build multiple spatial levels.
 
 This is the spatial component of the renormalizing generative model (RGM)
@@ -77,18 +77,16 @@ def _build_parent_mapping_for_group(
                         where N = number of time points * number of group-sites.
 
     Returns:
-        parent_ids: (N,) array of parent state indices
+        parent_ids: (N,) array of parent state indices (int64)
         pattern_to_parent: dict mapping pattern tuples to parent indices
     """
     # Each row is a pattern of 4 child states
-    # We assign a unique parent index per distinct pattern.
     patterns_as_tuples = [tuple(row.tolist()) for row in child_patterns]
     unique_patterns, inverse = np.unique(patterns_as_tuples,
                                          return_inverse=True)
-    # unique_patterns is array of tuples; indices 0..(n_unique-1)
-    parent_ids = inverse.astype(np.int32)
+    parent_ids = inverse.astype(np.int64)  # 1D int array
     pattern_to_parent = {
-        pattern: idx for idx, pattern in enumerate(unique_patterns)
+        pattern: int(idx) for idx, pattern in enumerate(unique_patterns)
     }
     return parent_ids, pattern_to_parent
 
@@ -105,7 +103,7 @@ def rg_step_level(
       - for each group identity (top-left coordinate), build a local
         mapping from unique child patterns to parent states, ensuring:
           * no shared children between different groups (by construction),
-          * unique columns in D for each parent.
+          * unique rows in D for each parent (one row per pattern).
 
     Args:
         states_grid: (T, H, W) integer states at current level.
@@ -126,11 +124,6 @@ def rg_step_level(
     H2, W2 = H // 2, W // 2
 
     # Extract 2x2 child patterns per group-site and time:
-    # indices:
-    #  (0,0): [0::2, 0::2]
-    #  (0,1): [0::2, 1::2]
-    #  (1,0): [1::2, 0::2]
-    #  (1,1): [1::2, 1::2]
     c00 = states_grid[:, 0::2, 0::2]
     c01 = states_grid[:, 0::2, 1::2]
     c10 = states_grid[:, 1::2, 0::2]
@@ -138,18 +131,11 @@ def rg_step_level(
 
     # Stack into (T, H2, W2, 4)
     combo = jnp.stack([c00, c01, c10, c11], axis=-1)
-
-    # We'll build parent mapping per group-site using NumPy on host.
     combo_np = np.array(combo, dtype=np.int32)  # (T, H2, W2, 4)
 
-    # For each group-site (h2, w2), gather all timepoints' child patterns,
-    # and map unique patterns -> local parent indices.
     group_pattern_maps: List[Dict[Tuple[int, ...], int]] = []
     parent_states_grid_np = np.zeros((T, H2, W2), dtype=np.int32)
 
-    # We'll also collect all (global) D rows: each parent corresponds to one
-    # unique 4-tuple of child states, but local indices per group-site
-    # must be offset to get global indices.
     D_rows: List[Tuple[int, ...]] = []
     global_parent_index = 0
 
@@ -161,25 +147,28 @@ def rg_step_level(
             parent_ids_local, pattern_to_parent_local = \
                 _build_parent_mapping_for_group(patterns_hw)
 
+            # Ensure 1D int array
+            parent_ids_local = np.asarray(parent_ids_local, dtype=np.int64)
+
             # Assign global parent indices for each local parent
-            local_to_global = {}
+            local_to_global: Dict[int, int] = {}
             for pattern, local_idx in pattern_to_parent_local.items():
+                local_idx_int = int(local_idx)
                 global_idx = global_parent_index
                 global_parent_index += 1
-                local_to_global[local_idx] = global_idx
+                local_to_global[local_idx_int] = global_idx
                 D_rows.append(pattern)  # each pattern is the 4-child tuple
 
             # Fill parent_states_grid for this group-site, time by time
             parent_ids_global = np.array(
-                [local_to_global[loc_idx] for loc_idx in parent_ids_local],
+                [local_to_global[int(loc_idx)] for loc_idx in parent_ids_local],
                 dtype=np.int32
             )
             parent_states_grid_np[:, h2, w2] = parent_ids_global
 
-            # Store mapping for this group-site (use global indices
-            # so D_rows and parent_states_grid are aligned)
+            # Store mapping for this group-site (use global indices)
             pattern_to_global = {
-                pattern: local_to_global[local_idx]
+                pattern: local_to_global[int(local_idx)]
                 for pattern, local_idx in pattern_to_parent_local.items()
             }
             group_pattern_maps.append(pattern_to_global)
@@ -306,7 +295,6 @@ def build_lorenz_spatial_hierarchy(
     hierarchy = build_spatial_hierarchy(states_flat, T, H_blocks, W_blocks,
                                         num_levels=num_levels)
 
-    # Attach some metadata from lorenz_data
     result = {
         "T": hierarchy["T"],
         "levels": hierarchy["levels"],
