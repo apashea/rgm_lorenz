@@ -3,12 +3,14 @@
 Variational message passing for the Lorenz hierarchy.
 
 This module provides:
-  - Single-level VMP for the lowest (patch) level using A, B_states, E_states.
+  - Single-chain VMP for the lowest (patch) level using A, B_states, E_states.
+  - Patch-wise lowest-level inference by vmapping the single-chain VMP over
+    all spatial patches (H0, W0).
   - Two-level state inference with spatial renormalization:
       * bottom-up messages from level 0 to level 1 via D
       * top-down messages from level 1 to level 0 via D
   - Top-level path inference using expected free energy over paths
-    computed via lorenz_efe.py (risk + ambiguity - epistemic).
+    computed via lorenz_efe (risk + ambiguity - epistemic).
 
 This is a Lorenz-specific instance of RGM-style inference and is structured
 to be extended further for full RGM behaviour.
@@ -32,18 +34,19 @@ from .lorenz_efe import (
 # 1. Utilities: observations and preferences for lowest level
 # -----------------------------------------------------------------------------
 
-def build_lowest_level_observations(
+def build_lowest_level_observations_flat(
     lorenz_data_dict: Dict[str, Any],
 ) -> jnp.ndarray:
     """
-    Build an observation array suitable for lowest-level inference.
+    Build a flat observation array suitable for lowest-level inference,
+    primarily for computing empirical preferences.
 
     We treat the quantized coefficients as "observations" in a one-hot form
     that is consistent with the A built in lorenz_model.py.
 
     Returns:
-        obs: (N, O) array, where N = T * H_blocks * W_blocks,
-             O = K * L; each row is a one-hot (or distribution) over O.
+        obs_flat: (N, O) array, where N = T * H_blocks * W_blocks,
+                  O = K * L; each row is a one-hot (or distribution) over O.
     """
     q_coeffs = lorenz_data_dict["q_coeffs"]  # (N, K)
     K = int(lorenz_data_dict["K"])
@@ -62,14 +65,34 @@ def build_lowest_level_observations(
         oh = jax.lax.fori_loop(0, K, body_fun, oh)
         return oh / (oh.sum() + 1e-8)
 
-    obs = jax.vmap(one_hot_row)(indices)
-    return obs  # (N, O)
+    obs_flat = jax.vmap(one_hot_row)(indices)  # (N, O)
+    return obs_flat
+
+
+def build_lowest_level_observations_grid(
+    lorenz_data_dict: Dict[str, Any],
+) -> jnp.ndarray:
+    """
+    Build an observation array reshaped as (T, H0, W0, O) for patch-wise
+    inference.
+
+    Returns:
+        obs_grid: (T, H0, W0, O)
+    """
+    obs_flat = build_lowest_level_observations_flat(lorenz_data_dict)  # (N, O)
+    T = int(lorenz_data_dict["T"])
+    H0 = int(lorenz_data_dict["H_blocks"])
+    W0 = int(lorenz_data_dict["W_blocks"])
+    O = obs_flat.shape[1]
+
+    obs_grid = obs_flat.reshape(T, H0, W0, O)
+    return obs_grid
 
 
 def build_preference_distribution_lowest(
     O: int,
     mode: str = "data_empirical",
-    obs: Optional[jnp.ndarray] = None,
+    obs_flat: Optional[jnp.ndarray] = None,
 ) -> jnp.ndarray:
     """
     Build a preference distribution C over lowest-level outcomes (O-dim).
@@ -79,23 +102,23 @@ def build_preference_distribution_lowest(
         mode: how to set preferences:
               - "uniform": no particular preferred outcome
               - "data_empirical": empirical distribution over training obs
-        obs: (N, O) one-hot/distribution observations (required for empirical)
+        obs_flat: (N, O) one-hot/distribution observations (required for empirical)
 
     Returns:
         C: (O,) preference distribution
     """
-    if mode == "uniform" or obs is None:
+    if mode == "uniform" or obs_flat is None:
         C = jnp.ones((O,), dtype=jnp.float32)
         C = C / C.sum()
         return C
 
-    C = obs.mean(axis=0)
+    C = obs_flat.mean(axis=0)
     C = C / (C.sum() + 1e-8)
     return C
 
 
 # -----------------------------------------------------------------------------
-# 2. Single-level VMP using A and B (no spatial coupling)
+# 2. Single-chain VMP using A and B (no spatial coupling)
 # -----------------------------------------------------------------------------
 
 def vmp_single_chain(
@@ -168,7 +191,7 @@ def vmp_single_chain(
 
     qs = jax.lax.fori_loop(0, num_iter, body_fun, qs)
 
-    # Observation-only free energy (for diagnostics)
+    # Observation-only free energy (for diagnostics, using a single-chain view)
     obs_list = [obs]
     A_list = [A]
     qs_list = [qs.mean(axis=0)]  # crude aggregation
@@ -178,7 +201,61 @@ def vmp_single_chain(
 
 
 # -----------------------------------------------------------------------------
-# 3. Two-level hierarchical state inference via D
+# 3. Patch-wise lowest-level inference (vmapped chains)
+# -----------------------------------------------------------------------------
+
+def infer_lowest_level_patches(
+    level0: LorenzLevel,
+    lorenz_data_dict: Dict[str, Any],
+    num_iter_lowest: int = 8,
+) -> Tuple[jnp.ndarray, float]:
+    """
+    Run VMP at the lowest level independently for each patch:
+
+      - obs_grid: (T, H0, W0, O)
+      - for each (h0, w0): run vmp_single_chain on (T, O) chain
+      - stack results into qs0_grid: (T, H0, W0, S0)
+
+    This respects the generative structure (independent patch chains
+    given A, B, E) and avoids a single gigantic chain.
+
+    Args:
+        level0: lowest-level LorenzLevel (A, B_states, E_states)
+        lorenz_data_dict: dataset dict
+        num_iter_lowest: iterations for single-chain VMP
+
+    Returns:
+        qs0_grid: (T, H0, W0, S0) posterior over lowest-level states
+        F_avg: average free energy across patches (diagnostic)
+    """
+    A0 = level0.A        # (S0, O)
+    B0 = level0.B_states # (S0, S0)
+    E0 = level0.E_states # (S0,)
+
+    obs_grid = build_lowest_level_observations_grid(lorenz_data_dict)  # (T, H0, W0, O)
+    T, H0, W0, O = obs_grid.shape
+    S0 = A0.shape[0]
+
+    # vmap vmp_single_chain over (H0, W0)
+    def infer_chain_for_patch(obs_patch: jnp.ndarray) -> Tuple[jnp.ndarray, float]:
+        # obs_patch: (T, O)
+        qs_chain, F_chain = vmp_single_chain(A0, B0, E0, obs_patch, num_iter=num_iter_lowest)
+        return qs_chain, F_chain
+
+    # First vmap over spatial dimension W0, then H0
+    vmap_over_w = jax.vmap(infer_chain_for_patch, in_axes=1, out_axes=(1, 1))
+    vmap_over_hw = jax.vmap(vmap_over_w, in_axes=1, out_axes=(1, 1))
+
+    qs_all, F_all = vmap_over_hw(obs_grid)   # qs_all: (T, H0, W0, S0), F_all: (H0, W0)
+
+    # Average free energy across patches for a simple diagnostic
+    F_avg = F_all.mean()
+
+    return qs_all, F_avg
+
+
+# -----------------------------------------------------------------------------
+# 4. Two-level hierarchical state inference via D
 # -----------------------------------------------------------------------------
 
 def bottom_up_message_level0_to_level1(
@@ -397,7 +474,7 @@ def vmp_two_level_states(
 
 
 # -----------------------------------------------------------------------------
-# 4. High-level inference entry point with EFE-based paths
+# 5. High-level inference entry point with EFE-based paths
 # -----------------------------------------------------------------------------
 
 def infer_lorenz_hierarchy(
@@ -412,13 +489,12 @@ def infer_lorenz_hierarchy(
     Run variational inference over states and paths in the Lorenz hierarchy.
 
     Steps:
-      1. Infer level-0 states over the patch sequence using A0, B0, E0.
-      2. Reshape to (T, H0, W0, S0).
-      3. If a higher level exists:
+      1. Infer level-0 states patch-wise using A0, B0, E0 (one chain per patch).
+      2. If a higher level exists:
            - Run two-level hierarchical state inference using D between
              level 0 and 1 (bottom-up + top-down).
-      4. Build a preference distribution C over lowest-level outcomes.
-      5. If the top level has a path factor, compute expected free energy
+      3. Build a preference distribution C over lowest-level outcomes.
+      4. If the top level has a path factor, compute expected free energy
          G_tu for paths via lorenz_efe, and update q(u_t) using G and
          B_paths/E_paths.
 
@@ -436,7 +512,7 @@ def infer_lorenz_hierarchy(
                level 0: (T, H0, W0, S0)
                level 1: (T, H1, W1, S1) if exists
           'qu_levels': list with path posteriors or None per level
-          'F_lowest': free energy at lowest level (observation-only approximation)
+          'F_lowest': average free energy at lowest level (observation-only approximation)
     """
     T = hierarchy.T
     H0 = hierarchy.H_blocks
@@ -445,24 +521,20 @@ def infer_lorenz_hierarchy(
     # Level 0 model
     level0: LorenzLevel = hierarchy.levels[0]
     A0 = level0.A
-    B0 = level0.B_states
-    E0 = level0.E_states
-
-    # Observations for level 0
-    obs_flat = build_lowest_level_observations(lorenz_data_dict)  # (N, O)
-    N = obs_flat.shape[0]
     S0 = A0.shape[0]
     O = A0.shape[1]
+
+    # Observations for level 0 (flat) for preferences
+    obs_flat = build_lowest_level_observations_flat(lorenz_data_dict)  # (N, O)
+    N = obs_flat.shape[0]
     assert N == T * H0 * W0, "Observation length mismatch."
 
     # Preferences over outcomes at lowest level
-    C = build_preference_distribution_lowest(O, mode=pref_mode, obs=obs_flat)
+    C = build_preference_distribution_lowest(O, mode=pref_mode, obs_flat=obs_flat)
 
-    # 1. Infer Level-0 states for the whole patch sequence
-    qs0_flat, F0 = vmp_single_chain(A0, B0, E0, obs_flat, num_iter=num_iter_lowest)
-
-    # Reshape to (T, H0, W0, S0)
-    qs0_grid = qs0_flat.reshape(T, H0, W0, S0)
+    # 1. Infer Level-0 states patch-wise
+    qs0_grid, F0_avg = infer_lowest_level_patches(level0, lorenz_data_dict,
+                                                  num_iter_lowest=num_iter_lowest)
 
     qs_levels: List[Optional[jnp.ndarray]] = [qs0_grid]
     qu_levels: List[Optional[jnp.ndarray]] = [None]
@@ -490,9 +562,6 @@ def infer_lorenz_hierarchy(
     top_idx = len(hierarchy.levels) - 1
     level_top = hierarchy.levels[top_idx]
     if level_top.num_paths > 0 and qs1_grid is not None:
-        # Compute G_tu via lorenz_efe
-        from .lorenz_efe import compute_expected_free_energy_paths, update_path_posterior_from_G
-
         G_tu = compute_expected_free_energy_paths(
             level_top,
             level0,
@@ -514,5 +583,5 @@ def infer_lorenz_hierarchy(
     return {
         "qs_levels": qs_levels,
         "qu_levels": qu_levels,
-        "F_lowest": F0,
+        "F_lowest": F0_avg,
     }
