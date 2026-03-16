@@ -3,15 +3,15 @@
 Variational message passing for the Lorenz hierarchy.
 
 This module provides:
-  - Single-chain VMP for the lowest (patch) level using A, B_states, E_states.
-  - Patch-wise lowest-level inference by looping over patches and calling
-    the single-chain VMP (to keep memory usage manageable).
-  - Two-level state inference with spatial renormalization:
-      * bottom-up messages from level 0 to level 1 via D
-      * top-down messages from level 1 to level 0 via D
-  - Top-level path inference using expected free energy over paths
-    computed via lorenz_efe (risk + ambiguity - epistemic), with
-    path-dependent transitions B_states_paths at the top state level.
+- Single-chain VMP for the lowest (patch) level using A, B_states, E_states.
+- Patch-wise lowest-level inference by looping over patches and calling
+  the single-chain VMP (to keep memory usage manageable).
+- Two-level state inference with spatial renormalization:
+  * bottom-up messages from level 0 to level 1 via D
+  * top-down messages from level 1 to level 0 via D
+- Top-level path inference using expected free energy over paths
+  computed via lorenz_efe (risk + ambiguity - epistemic), with
+  path-dependent transitions B_states_paths at the top state level.
 
 This is a Lorenz-specific instance of RGM-style inference and is structured
 to be extended further for full RGM behaviour.
@@ -29,7 +29,6 @@ from .lorenz_efe import (
     compute_expected_free_energy_paths,
     update_path_posterior_from_G,
 )
-
 
 # -----------------------------------------------------------------------------
 # 1. Utilities: observations and preferences for lowest level
@@ -486,7 +485,7 @@ def vmp_two_level_states(
             log_bias_chain: jnp.ndarray,
         ) -> jnp.ndarray:
             """
-            qs0_chain:    (T, S0)
+            qs0_chain:     (T, S0)
             log_bias_chain:(T, S0)
             """
             def forward_messages(qs_):
@@ -508,7 +507,7 @@ def vmp_two_level_states(
                     msgs.append(msg)
                     next_q = qs_[t]
                 msgs = msgs[::-1]
-                return msgs
+                return jnp.stack(msgs, axis=0)
 
             def vmp_iter(qs_):
                 m_plus = forward_messages(qs_)
