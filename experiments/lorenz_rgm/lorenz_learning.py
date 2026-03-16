@@ -14,10 +14,23 @@ This module implements:
 - A training loop scaffold that alternates between inference and parameter
   updates over one or more Lorenz trajectories.
 
-It assumes:
-- The generative model structure (levels, D matrices, path factors)
-  is defined in lorenz_model.py.
-- Inference over states and paths is provided by lorenz_inference.py.
+CONVENTIONS (consistent with lorenz_model.py):
+
+- For each level ℓ with S_l states and U_l path/control values:
+
+    B_states_full_l[s_next, s, u] = P(s_next | s, u)
+
+  with shape (S_l, S_l, U_l). For levels without multiple paths we set U_l=1.
+
+- At the top level (with num_paths_top = U), we store path-dependent
+  transitions in:
+
+    B_states_paths_alpha: (S_top, S_top, U)
+
+  and path dynamics in:
+
+    B_paths_alpha[u_next, u] = α for P(u_next | u), shape (U, U)
+    E_paths_alpha[u] = α for P(u_0 = u), shape (U,)
 """
 
 from typing import Dict, Any, List, Tuple, Optional
@@ -78,14 +91,15 @@ def accumulate_B_counts_level0(
         qs0_grid: (T, H0, W0, S0)
 
     Returns:
-        dB0: (S0, S0) Dirichlet count increments for B0
+        dB0: (S0, S0) Dirichlet count increments for B0, stored with
+             dB0[s_next, s] ≈ counts for P(s_next | s).
     """
     T, H0, W0, S0 = qs0_grid.shape
 
     qt = qs0_grid[:-1].reshape((T - 1) * H0 * W0, S0)   # (N_tr, S0)
     qt1 = qs0_grid[1:].reshape((T - 1) * H0 * W0, S0)   # (N_tr, S0)
 
-    dB0 = qt.T @ qt1  # (S0, S0)
+    dB0 = qt1.T @ qt  # (S0, S0) as [s_next, s]
     return dB0
 
 
@@ -138,14 +152,15 @@ def accumulate_B_counts_level1(
         qs1_grid: (T, H1, W1, S1)
 
     Returns:
-        dB1: (S1, S1) Dirichlet count increments for B1
+        dB1: (S1, S1) Dirichlet count increments for B1, with
+             dB1[s_next, s] ≈ counts for P(s_next | s).
     """
     T, H1, W1, S1 = qs1_grid.shape
 
     qt = qs1_grid[:-1].reshape((T - 1) * H1 * W1, S1)   # (N_tr, S1)
     qt1 = qs1_grid[1:].reshape((T - 1) * H1 * W1, S1)   # (N_tr, S1)
 
-    dB1 = qt.T @ qt1  # (S1, S1)
+    dB1 = qt1.T @ qt  # (S1, S1) as [s_next, s]
     return dB1
 
 
@@ -178,24 +193,21 @@ def accumulate_B_states_paths_counts_level1(
 ) -> jnp.ndarray:
     """
     Accumulate expected counts for path-dependent state transitions
-    B_states_paths[u, s, s'] at the top level.
+    B_states_paths[s_next, s, u] at the (current) top level.
 
     We approximate:
-        dB_states_paths[u, s, s']
+        dB_states_paths[s_next, s, u]
           ≈ sum_t q(u_t = u)
-              * sum_{h1,w1} q(s^1_{t,h1,w1} = s)
-                             q(s^1_{t+1,h1,w1} = s').
-
-    i.e. transitions between level-1 states are weighted by the path
-    posterior q(u_t) at each time step, so each path can learn its own
-    transition structure.
+              * sum_{h1,w1} q(s^1_{t+1,h1,w1} = s_next)
+                             q(s^1_{t,h1,w1} = s).
 
     Args:
         qs1_grid: (T, H1, W1, S1)
         qu_top: (T, U) posterior over paths at top level
 
     Returns:
-        dB_states_paths: (U, S1, S1) Dirichlet count increments
+        dB_states_paths: (S1, S1, U) Dirichlet count increments
+                         consistent with B[s_next, s, u].
     """
     T, H1, W1, S1 = qs1_grid.shape
     Tq, U = qu_top.shape
@@ -205,24 +217,20 @@ def accumulate_B_states_paths_counts_level1(
     N_sites = H1 * W1
     qs1_flat = qs1_grid.reshape(T, N_sites, S1)  # (T, N_sites, S1)
 
-    # Initialize counts
-    dB_states_paths = jnp.zeros((U, S1, S1), dtype=jnp.float32)
+    dB_states_paths = jnp.zeros((S1, S1, U), dtype=jnp.float32)
 
-    # Loop over time points where transitions occur (0..T-2)
     for t in range(T - 1):
         qs_t = qs1_flat[t]     # (N_sites, S1)
         qs_tp1 = qs1_flat[t+1] # (N_sites, S1)
 
-        # Aggregate site-wise outer products into a base transition at time t
-        # base_t[s, s'] ≈ sum_{h,w} q_t(s) q_{t+1}(s')
-        base_t = qs_t.T @ qs_tp1  # (S1, S1)
+        # base_t[s_next, s] ≈ sum_{sites} q_t(s) q_{t+1}(s_next)
+        base_t = qs_tp1.T @ qs_t  # (S1, S1)
 
-        # Weight this time-slice transition by q(u_t = u) for each path
         qu_t = qu_top[t]  # (U,)
         for u in range(U):
-            dB_states_paths = dB_states_paths.at[u].add(base_t * qu_t[u])
+            dB_states_paths = dB_states_paths.at[:, :, u].add(base_t * qu_t[u])
 
-    return dB_states_paths  # (U, S1, S1)
+    return dB_states_paths  # (S1, S1, U)
 
 
 def accumulate_B_E_paths(
@@ -237,6 +245,7 @@ def accumulate_B_E_paths(
 
     Returns:
         dB_paths: (U, U) Dirichlet count increments for B_paths
+                  with dB_paths[u_next, u].
         dE_paths: (U,) Dirichlet count increments for E_paths
     """
     T, U = qu_top.shape
@@ -244,7 +253,7 @@ def accumulate_B_E_paths(
     qu_t1 = qu_top[1:]  # (T-1, U)
 
     # Approximate joint q(u_t, u_{t+1}) as outer product of marginals
-    dB_paths = qu_t.T @ qu_t1  # (U, U)
+    dB_paths = qu_t1.T @ qu_t  # (U, U) as [u_next, u]
     dE_paths = qu_top[0]       # (U,)
     return dB_paths, dE_paths
 
@@ -373,10 +382,10 @@ def params_to_categorical(
 
     Returns:
         A_list: list of A^l matrices (S_l, O_l)
-        B_list: list of B^l matrices (S_l, S_l)
+        B_list: list of B^l matrices (S_l, S_l) with B[s_next, s]
         E_list: list of E^l vectors (S_l,)
         C0: preferences over lowest outcomes (O0,)
-        B_states_paths: (U, S_top, S_top) or None
+        B_states_paths: (S_top, S_top, U) or None
         B_paths: (U, U) or None
         E_paths: (U,) or None
     """
@@ -392,7 +401,8 @@ def params_to_categorical(
         else:
             A_l = A_alpha_l
 
-        B_l = B_alpha_l / (B_alpha_l.sum(axis=1, keepdims=True) + 1e-8)
+        # Normalize B over s_next axis (axis 0): B[s_next, s]
+        B_l = B_alpha_l / (B_alpha_l.sum(axis=0, keepdims=True) + 1e-8)
         E_l = E_alpha_l / (E_alpha_l.sum() + 1e-8)
 
         A_list.append(A_l)
@@ -406,16 +416,16 @@ def params_to_categorical(
     # Path-related categorical parameters
     if params.B_paths_alpha is not None and params.E_paths_alpha is not None:
         B_paths = params.B_paths_alpha / (
-            params.B_paths_alpha.sum(axis=1, keepdims=True) + 1e-8
-        )
+            params.B_paths_alpha.sum(axis=0, keepdims=True) + 1e-8
+        )  # B_paths[u_next, u]
         E_paths = params.E_paths_alpha / (params.E_paths_alpha.sum() + 1e-8)
     else:
         B_paths, E_paths = None, None
 
     if params.B_states_paths_alpha is not None:
         B_states_paths = params.B_states_paths_alpha / (
-            params.B_states_paths_alpha.sum(axis=2, keepdims=True) + 1e-8
-        )
+            params.B_states_paths_alpha.sum(axis=0, keepdims=True) + 1e-8
+        )  # (S_top, S_top, U)
     else:
         B_states_paths = None
 
