@@ -1,66 +1,82 @@
 # lorenz_model.py
 """
-Lorenz-specific renormalizing generative model (RGM) hierarchy.
+Model construction for the Lorenz RGM.
 
 This module defines:
-  - LorenzLevel: a single level in the hierarchy, with:
-      * Hidden states s^l_t over a finite state space of size S_l
-      * Emission model A^l(o | s) for observations at that level (if any)
-      * Transition model B^l(s' | s) for temporal dynamics
-      * Initial prior E^l(s_1)
-      * Optional spatial mapping D^l from parent states to child configurations
-      * Optional path factor (u_t) with its own B_paths, E_paths
-      * Optional path-dependent state transitions B_states_paths(u, s' | s)
-  - LorenzHierarchy: a stack of LorenzLevel objects plus structural info
-    (T, H_blocks, W_blocks, etc.)
-  - LorenzRGMParams: Dirichlet concentration parameters for A/B/E/C
-    at each level, plus B_paths/E_paths at the top level.
-  - Builders:
-      * build_lorenz_hierarchy: construct the hierarchy with fixed
-        initial parameters
-      * init_dirichlet_params_from_hierarchy: initialize Dirichlet alphas
-        from an existing hierarchy
-      * build_lorenz_hierarchy_from_params: rebuild a hierarchy from
-        learned Dirichlet parameters.
+- LorenzLevel: a single spatial / temporal level in the RGM.
+- LorenzHierarchy: a stack of LorenzLevels with associated state grids.
+- Functions to build an initial Lorenz hierarchy given a spatial
+  RG hierarchy (states_grids, D mappings).
+- Functions to initialize and convert Dirichlet parameters for A, B, E, C,
+  and path-related quantities.
+
+IMPORTANT CONVENTIONS (new, unified B layout):
+
+- For each level ℓ with S_l hidden states:
+
+    B_states_full_l: (S_l_next, S_l_current, U_l)
+
+  where U_l is the number of "control/path" values at that level.
+  By default, U_l = 1 for ordinary levels (no explicit paths) and
+  U_top = num_paths_top for the top level where a path factor exists.
+
+  Semantics:
+      B_states_full_l[s_next, s_current, u] = P(s_next | s_current, u_l = u)
+
+  For levels without multiple paths, we fix U_l = 1 and always use u=0,
+  so the effective transition matrix is:
+
+      B_states_l = B_states_full_l[:, :, 0]  # (S_l, S_l)
+
+- At the top level L-1, we also define:
+
+    B_paths: (U, U)       with B_paths[u_next, u] = P(u_next | u)
+    E_paths: (U,)         with E_paths[u] = P(u_0 = u)
+
+- For compatibility with existing code:
+
+    LorenzLevel.B_states   will hold the effective (S, S) matrix for that level,
+                           i.e., B_states_full[:, :, 0] for levels with U_l = 1,
+                           or a default mixture over paths for the top level if
+                           needed for certain operations.
+
+    LorenzLevel.B_states_paths will now store the full (S, S, U) tensor at the
+                               top level only, and None at other levels.
 """
 
-from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass
+from typing import List, Optional, Dict, Any, Tuple
 
 import jax.numpy as jnp
 import numpy as np
 
 
 # -----------------------------------------------------------------------------
-# Core level and hierarchy dataclasses
+# Data classes
 # -----------------------------------------------------------------------------
 
 @dataclass
 class LorenzLevel:
     """
-    A single level in the Lorenz RGM.
+    A single level in the Lorenz hierarchy.
 
     Attributes:
         S: number of hidden states at this level
-        A: (S, O) emission matrix P(o | s); O=0 if no explicit emissions
-        B_states: (S, S) transition matrix P(s' | s) (path-averaged baseline)
-        E_states: (S,) prior over initial state s_1
-        D: for spatial levels > 0:
-           - (S, child_config_dim) deterministic mapping from parent state
-             to child state pattern (e.g., 4 child indices for 2x2 groups)
-           for level 0: D is None
-        num_paths: number of paths (policies) at this level
-        B_paths: (num_paths, num_paths) transition over path states u_t
-        E_paths: (num_paths,) prior over u_1
-        B_states_paths: (num_paths, S, S) path-dependent state transitions
-                        B_states_paths[u] = B^{(u)}(s' | s) at this level
-                        (typically only non-None at the top level)
+        A: emission matrix (S, O) or empty if no direct observations
+        B_states: effective transition matrix (S, S) used in generic code
+        E_states: prior over initial states (S,)
+        D: deterministic RG mapping from parent to child states, or None
+        num_paths: number of path states at this level (U_l)
+        B_paths: path transition matrix (U_l, U_l) or None
+        E_paths: prior over initial path state (U_l,) or None
+        B_states_paths: full path-dependent transitions (S, S, U_l) or None
     """
     S: int
     A: jnp.ndarray
     B_states: jnp.ndarray
     E_states: jnp.ndarray
     D: Optional[jnp.ndarray]
+
     num_paths: int
     B_paths: Optional[jnp.ndarray]
     E_paths: Optional[jnp.ndarray]
@@ -70,15 +86,14 @@ class LorenzLevel:
 @dataclass
 class LorenzHierarchy:
     """
-    Full Lorenz RGM hierarchy.
+    A hierarchical Lorenz model with multiple spatial levels.
 
     Attributes:
-        levels: list of LorenzLevel objects, lowest level at index 0
-        states_grids: list of (T, H_l, W_l) integer grids encoding
-                      the layout / identity of states per level
+        levels: list of LorenzLevel objects, from finest (level 0) to coarsest (top)
+        states_grids: list of state grids per level (T, H_l, W_l)
         T: number of time steps
-        H_blocks: number of patch rows at lowest level
-        W_blocks: number of patch columns at lowest level
+        H_blocks: number of lowest-level patches in vertical dimension
+        W_blocks: number of lowest-level patches in horizontal dimension
     """
     levels: List[LorenzLevel]
     states_grids: List[jnp.ndarray]
@@ -87,160 +102,89 @@ class LorenzHierarchy:
     W_blocks: int
 
 
-# -----------------------------------------------------------------------------
-# Dirichlet parameter container (for learning)
-# -----------------------------------------------------------------------------
-
 @dataclass
 class LorenzRGMParams:
     """
-    Dirichlet concentration parameters for a Lorenz RGM.
+    Dirichlet concentration parameters for the Lorenz RGM.
 
     Attributes:
-        A_alpha: list of Dirichlet concentrations over A^l:
-                 A_alpha[l] has shape (S_l, O_l)
-        B_alpha: list of Dirichlet concentrations over B_states^l:
-                 B_alpha[l] has shape (S_l, S_l)
-        E_alpha: list of Dirichlet concentrations over E_states^l:
-                 E_alpha[l] has shape (S_l,)
-        C_alpha: Dirichlet concentration over lowest-level outcomes C^0(o):
-                 shape (O_0,)
-
-        B_states_paths_alpha: Dirichlet concentrations for path-dependent
-                 state transitions at the top level:
-                 shape (U, S_top, S_top) or None if not used
-        B_paths_alpha: Dirichlet concentrations over path transitions:
-                 shape (U, U) or None if not used
-        E_paths_alpha: Dirichlet concentrations over initial path states:
-                 shape (U,) or None if not used
+        A_alpha: list of A^l alphas, each (S_l, O_l)
+        B_alpha: list of B^l alphas, each (S_l, S_l)
+        E_alpha: list of E^l alphas, each (S_l,)
+        C_alpha: preferences over lowest-level outcomes (O0,)
+        B_states_paths_alpha: (S_top, S_top, U_top) or None
+        B_paths_alpha: (U_top, U_top) or None
+        E_paths_alpha: (U_top,) or None
     """
     A_alpha: List[jnp.ndarray]
     B_alpha: List[jnp.ndarray]
     E_alpha: List[jnp.ndarray]
     C_alpha: jnp.ndarray
+
     B_states_paths_alpha: Optional[jnp.ndarray]
     B_paths_alpha: Optional[jnp.ndarray]
     E_paths_alpha: Optional[jnp.ndarray]
 
 
 # -----------------------------------------------------------------------------
-# Helper functions: constructing A, B, E, path factors
+# Utilities for building B matrices
 # -----------------------------------------------------------------------------
-
-def build_lorenz_A0(S0: int, K: int, L: int) -> jnp.ndarray:
-    """
-    Build the lowest-level emission matrix A0 for the Lorenz example.
-
-    Hidden states encode K discrete coefficients, each taking L values.
-    Outcomes are one-hot over K*L possible coefficient-value slots.
-
-    Construction:
-      - each hidden state s corresponds to a unique K-tuple (c1,...,cK)
-      - A0(s, o) = 1 if the one-hot outcome o is consistent with that tuple.
-
-    This is a fixed initialization; learning code will update A_alpha and
-    re-normalize to get a learned A0.
-    """
-    O = K * L
-    assert S0 == L ** K, "S0 must be L^K for this construction."
-
-    # Precompute state -> coefficients via base-L representation
-    coeffs = np.zeros((S0, K), dtype=np.int32)
-    for s in range(S0):
-        x = s
-        for k in reversed(range(K)):
-            coeffs[s, k] = x % L
-            x //= L
-
-    A0 = np.zeros((S0, O), dtype=np.float32)
-    for s in range(S0):
-        for k in range(K):
-            idx = k * L + coeffs[s, k]
-            A0[s, idx] = 1.0
-
-    A0 = A0 / (A0.sum(axis=1, keepdims=True) + 1e-8)
-    return jnp.array(A0)
-
 
 def build_uniform_B(S: int, self_bias: float = 1.0) -> jnp.ndarray:
     """
-    Build a simple transition matrix B(s'|s) with optional self-transition bias.
-
-    Args:
-        S: number of states
-        self_bias: additional weight on diagonal entries
+    Build a simple transition matrix B(s'|s) with a self-transition bias.
 
     Returns:
-        B: (S, S) matrix, rows normalized to 1.
+        B: (S, S) with B[s_next, s] = P(s_next | s)
     """
-    B = np.ones((S, S), dtype=np.float32)
-    np.fill_diagonal(B, 1.0 + self_bias)
-    B = B / (B.sum(axis=1, keepdims=True) + 1e-8)
-    return jnp.array(B)
+    B = jnp.ones((S, S), dtype=jnp.float32)
+    B = B + self_bias * jnp.eye(S, dtype=jnp.float32)
+    B = B / (B.sum(axis=0, keepdims=True) + 1e-8)
+    return B
 
 
-def build_uniform_E(S: int) -> jnp.ndarray:
+def build_path_dependent_B_states(
+    S: int,
+    num_paths: int,
+    self_bias: float = 1.0,
+) -> jnp.ndarray:
     """
-    Build a uniform prior over initial states.
-
-    Args:
-        S: number of states
+    Build a path-dependent transition tensor for a level with S states and
+    num_paths path states.
 
     Returns:
-        E: (S,) vector with uniform probabilities.
+        B_states_paths: (S, S, U) where
+            B_states_paths[s_next, s, u] = P(s_next | s, u)
     """
-    E = np.ones((S,), dtype=np.float32)
-    E = E / E.sum()
-    return jnp.array(E)
+    B_base = build_uniform_B(S, self_bias=self_bias)  # (S_next, S_current)
+    B_states_paths = jnp.stack(
+        [B_base for _ in range(num_paths)],
+        axis=2,
+    )  # (S, S, U)
+    return B_states_paths
 
 
-def build_path_dynamics(num_paths: int) -> Tuple[Optional[jnp.ndarray], Optional[jnp.ndarray]]:
+def build_path_dynamics(num_paths: int) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """
-    Build a simple path factor dynamics (B_paths, E_paths) for the top level.
-
-    Args:
-        num_paths: number of path states u_t
+    Build simple path transition dynamics B_paths and initial prior E_paths.
 
     Returns:
-        B_paths: (num_paths, num_paths) transition matrix over paths
-        E_paths: (num_paths,) prior over initial path state
+        B_paths: (U, U) with B_paths[u_next, u] = P(u_next | u)
+        E_paths: (U,) initial prior over u_0
     """
-    if num_paths <= 0:
-        return None, None
+    U = num_paths
+    B_paths = jnp.ones((U, U), dtype=jnp.float32)
+    B_paths = B_paths + 2.0 * jnp.eye(U, dtype=jnp.float32)
+    B_paths = B_paths / (B_paths.sum(axis=0, keepdims=True) + 1e-8)
 
-    B_paths = np.ones((num_paths, num_paths), dtype=np.float32)
-    np.fill_diagonal(B_paths, 2.0)  # mild self-bias
-    B_paths = B_paths / (B_paths.sum(axis=1, keepdims=True) + 1e-8)
+    E_paths = jnp.ones((U,), dtype=jnp.float32)
+    E_paths = E_paths / (E_paths.sum() + 1e-8)
 
-    E_paths = np.ones((num_paths,), dtype=np.float32)
-    E_paths = E_paths / E_paths.sum()
-
-    return jnp.array(B_paths), jnp.array(E_paths)
-
-
-def build_path_dependent_B_states(S: int, num_paths: int, self_bias: float = 1.0) -> jnp.ndarray:
-    """
-    Build an initial set of path-dependent state transition matrices
-    for the top level: B_states_paths[u] = B^{(u)}(s' | s).
-
-    For now, all B^{(u)} are identical (uniform + self-bias); learning
-    will later differentiate them.
-
-    Args:
-        S: number of top-level states
-        num_paths: number of paths
-        self_bias: diagonal bias for each B^{(u)}
-
-    Returns:
-        B_states_paths: (num_paths, S, S)
-    """
-    B_base = build_uniform_B(S, self_bias=self_bias)
-    B_stack = jnp.stack([B_base for _ in range(num_paths)], axis=0)
-    return B_stack
+    return B_paths, E_paths
 
 
 # -----------------------------------------------------------------------------
-# Building the Lorenz hierarchy (fixed parameters, no learning yet)
+# Build hierarchy from spatial RG structure (2 levels for now)
 # -----------------------------------------------------------------------------
 
 def build_lorenz_hierarchy(
@@ -253,120 +197,121 @@ def build_lorenz_hierarchy(
     thickness: int,
     num_spatial_levels: int,
     num_paths_top: int,
-    lorenz_spatial_hierarchy: Optional[Dict[str, Any]] = None,
+    lorenz_spatial_hierarchy: Dict[str, Any],
 ) -> LorenzHierarchy:
     """
-    Build the Lorenz RGM hierarchy with fixed initial parameters.
+    Build an initial LorenzHierarchy with fixed A/B/E/D/path parameters,
+    given a spatial RG hierarchy (states_grids, D matrices) from
+    lorenz_renorm.build_lorenz_spatial_hierarchy.
 
-    Assumes a spatial hierarchy has already been built using
-    lorenz_renorm.build_lorenz_spatial_hierarchy, providing:
-      - level-0 states_grid (T, H0, W0) for patches
-      - level-1 states_grid (T, H1, W1) for spatially grouped parent states
-      - D1 mapping for spatial level.
+    Currently supports:
+        - level 0: patch level
+        - level 1: one parent spatial level
+    but is designed to be extended to more levels.
 
     Args:
-        T: number of time steps
-        dt: time step (kept for completeness)
-        img_size: size of images (img_size x img_size)
-        patch_size: size of patches (patch_size x patch_size)
-        K: number of singular vectors / coefficients per patch
-        L: number of discrete levels per coefficient
-        thickness: placeholder for richer models
-        num_spatial_levels: number of spatial RG levels (1 => patch + one parent)
-        num_paths_top: number of path states at the top level
-        lorenz_spatial_hierarchy: dict from build_lorenz_spatial_hierarchy
+        T, dt, img_size, patch_size, K, L, thickness: config parameters
+        num_spatial_levels: number of RG steps used to build spatial_h
+        num_paths_top: number of path states at top level
+        lorenz_spatial_hierarchy: dict with keys:
+            - "levels": list of dicts with "states_grid" and "D" (for l>0)
+            - "H_blocks", "W_blocks"
 
     Returns:
-        LorenzHierarchy with two state levels (0 patches, 1 parents) and
-        a path factor at the top level.
+        LorenzHierarchy
     """
-    if lorenz_spatial_hierarchy is None:
-        raise ValueError(
-            "lorenz_spatial_hierarchy must be provided (from lorenz_renorm)."
-        )
-
     levels: List[LorenzLevel] = []
     states_grids: List[jnp.ndarray] = []
 
-    # Lowest level: patches
-    H0 = int(lorenz_spatial_hierarchy["H_blocks"])
-    W0 = int(lorenz_spatial_hierarchy["W_blocks"])
+    # ---------------------
+    # Level 0 (patch level)
+    # ---------------------
     level0_states_grid = lorenz_spatial_hierarchy["levels"][0]["states_grid"]
     states_grids.append(level0_states_grid)
 
-    # Hidden state space at lowest level
-    S0 = L ** K
-    O0 = K * L
+    H0 = int(lorenz_spatial_hierarchy["H_blocks"])
+    W0 = int(lorenz_spatial_hierarchy["W_blocks"])
+    T_h = int(lorenz_spatial_hierarchy.get("T", level0_states_grid.shape[0]))
 
-    A0 = build_lorenz_A0(S0, K, L)
-    B0 = build_uniform_B(S0, self_bias=1.0)
-    E0 = build_uniform_E(S0)
+    S0 = int(jnp.max(level0_states_grid) + 1)
+
+    # Lowest-level emission A0: (S0, O0) with O0 = K * L
+    O0 = K * L
+    A0 = jnp.ones((S0, O0), dtype=jnp.float32)
+    A0 = A0 / (A0.sum(axis=1, keepdims=True) + 1e-8)
+
+    # Transition B0: (S0, S0, U0=1)
+    B0_base = build_uniform_B(S0, self_bias=1.0)  # (S0, S0)
+    B0_full = B0_base[:, :, None]                 # (S0, S0, 1)
+
+    # Prior E0: (S0,)
+    E0 = jnp.ones((S0,), dtype=jnp.float32)
+    E0 = E0 / (E0.sum() + 1e-8)
 
     level0 = LorenzLevel(
         S=S0,
         A=A0,
-        B_states=B0,
+        B_states=B0_base,          # effective (S0, S0)
         E_states=E0,
         D=None,
-        num_paths=0,
+        num_paths=1,               # trivial path dimension
         B_paths=None,
         E_paths=None,
-        B_states_paths=None,
+        B_states_paths=B0_full,    # (S0, S0, 1)
     )
     levels.append(level0)
 
-    # Spatial parent level
-    current_num_levels = len(lorenz_spatial_hierarchy["levels"])
-    if current_num_levels < 2:
-        raise ValueError(
-            "Spatial hierarchy must have at least 2 levels (patch and parent)."
+    # ---------------------
+    # Level 1 (first parent)
+    # ---------------------
+    if num_spatial_levels >= 1 and len(lorenz_spatial_hierarchy["levels"]) > 1:
+        spatial_level1 = lorenz_spatial_hierarchy["levels"][1]
+        states_grid1 = spatial_level1["states_grid"]
+        D1 = spatial_level1["D"]  # (S1, 4)
+        states_grids.append(states_grid1)
+
+        S1 = int(jnp.max(states_grid1) + 1)
+
+        # For now, no direct observations at level 1: A1 is empty
+        A1 = jnp.zeros((S1, 0), dtype=jnp.float32)
+
+        # Level-1 transitions, again with a trivial path dimension U1=1
+        B1_base = build_uniform_B(S1, self_bias=1.0)  # (S1, S1)
+        B1_full = B1_base[:, :, None]                 # (S1, S1, 1)
+
+        E1 = jnp.ones((S1,), dtype=jnp.float32)
+        E1 = E1 / (E1.sum() + 1e-8)
+
+        # Path factor will live at the top level (not here) in the 3-level design.
+        # For now (2-level hierarchy), we can either attach it here or later.
+        # In this version, we DO NOT attach paths to level 1; they will be added
+        # at a higher level once the 3-level hierarchy is implemented.
+        level1 = LorenzLevel(
+            S=S1,
+            A=A1,
+            B_states=B1_base,
+            E_states=E1,
+            D=D1,
+            num_paths=1,
+            B_paths=None,
+            E_paths=None,
+            B_states_paths=B1_full,
         )
-
-    spatial_level1 = lorenz_spatial_hierarchy["levels"][1]
-    states_grid1 = spatial_level1["states_grid"]
-    D1 = spatial_level1["D"]  # (S1, 4)
-
-    states_grids.append(states_grid1)
-
-    S1 = int(D1.shape[0])
-
-    # Base transitions and prior at level 1
-    B1 = build_uniform_B(S1, self_bias=1.0)
-    E1 = build_uniform_E(S1)
-
-    # No explicit emissions at level 1 in this minimal Lorenz example
-    A1 = jnp.zeros((S1, 0), dtype=jnp.float32)
-
-    # Path factor at top level
-    B_paths, E_paths = build_path_dynamics(num_paths_top)
-    B_states_paths = build_path_dependent_B_states(S1, num_paths_top, self_bias=1.0) \
-        if num_paths_top > 0 else None
-
-    level1 = LorenzLevel(
-        S=S1,
-        A=A1,
-        B_states=B1,
-        E_states=E1,
-        D=D1,
-        num_paths=num_paths_top,
-        B_paths=B_paths,
-        E_paths=E_paths,
-        B_states_paths=B_states_paths,
-    )
-    levels.append(level1)
+        levels.append(level1)
 
     hierarchy = LorenzHierarchy(
         levels=levels,
         states_grids=states_grids,
-        T=T,
+        T=T_h,
         H_blocks=H0,
         W_blocks=W0,
     )
+
     return hierarchy
 
 
 # -----------------------------------------------------------------------------
-# Helper: initialize Dirichlet parameters from an existing hierarchy
+# Dirichlet parameter initialization and conversion
 # -----------------------------------------------------------------------------
 
 def init_dirichlet_params_from_hierarchy(
@@ -377,86 +322,74 @@ def init_dirichlet_params_from_hierarchy(
     alpha_B: float = 1.0,
     alpha_E: float = 1.0,
     alpha_C: float = 1.0,
-    alpha_B_paths: float = 1.0,
-    alpha_E_paths: float = 1.0,
-    alpha_B_states_paths: float = 1.0,
+    num_paths_top: int = 0,
 ) -> LorenzRGMParams:
     """
-    Initialize Dirichlet concentrations (A_alpha, B_alpha, E_alpha, C_alpha,
-    B_states_paths_alpha, B_paths_alpha, E_paths_alpha) given an existing
-    LorenzHierarchy.
-
-    This is the starting point for learning: subsequent updates to these
-    alphas will be performed by lorenz_learning.py, and A/B/E/C/B_paths/
-    B_states_paths for inference will be reconstructed by normalizing alphas.
+    Initialize Dirichlet concentration parameters from a given hierarchy.
 
     Args:
-        hierarchy: existing LorenzHierarchy (with fixed A/B/E/D/path)
-        K, L: used to determine O0 = K * L for lowest-level outcomes
-        alpha_*: symmetric prior strengths for corresponding Dirichlet priors
+        hierarchy: LorenzHierarchy with levels already built
+        K, L: for lowest level, O0 = K*L
+        alpha_A, alpha_B, alpha_E, alpha_C: scalar initializations
+        num_paths_top: number of path states at the top level
 
     Returns:
-        LorenzRGMParams with initialized Dirichlet alphas.
+        LorenzRGMParams with A_alpha, B_alpha, E_alpha, C_alpha,
+        and (if num_paths_top>0) B_states_paths_alpha, B_paths_alpha, E_paths_alpha.
     """
-    A_alpha: List[jnp.ndarray] = []
-    B_alpha: List[jnp.ndarray] = []
-    E_alpha: List[jnp.ndarray] = []
+    A_alpha_list: List[jnp.ndarray] = []
+    B_alpha_list: List[jnp.ndarray] = []
+    E_alpha_list: List[jnp.ndarray] = []
 
     for level in hierarchy.levels:
         S = level.S
-        O = level.A.shape[1]
+        A = level.A
+        B = level.B_states
+        E = level.E_states
 
-        if O > 0:
-            A_alpha_l = jnp.full((S, O), alpha_A, dtype=jnp.float32)
+        if A.size > 0:
+            A_alpha = jnp.full_like(A, alpha_A, dtype=jnp.float32)
         else:
-            A_alpha_l = jnp.zeros((S, 0), dtype=jnp.float32)
+            A_alpha = A
 
-        B_alpha_l = jnp.full((S, S), alpha_B, dtype=jnp.float32)
-        E_alpha_l = jnp.full((S,), alpha_E, dtype=jnp.float32)
+        B_alpha = jnp.full_like(B, alpha_B, dtype=jnp.float32)
+        E_alpha = jnp.full_like(E, alpha_E, dtype=jnp.float32)
 
-        A_alpha.append(A_alpha_l)
-        B_alpha.append(B_alpha_l)
-        E_alpha.append(E_alpha_l)
+        A_alpha_list.append(A_alpha)
+        B_alpha_list.append(B_alpha)
+        E_alpha_list.append(E_alpha)
 
     O0 = K * L
     C_alpha = jnp.full((O0,), alpha_C, dtype=jnp.float32)
 
-    # Path-related alphas (assume only at top level)
-    top_level = hierarchy.levels[-1]
-    U = top_level.num_paths
+    # Path-related Dirichlet parameters at the top level
+    if num_paths_top > 0:
+        top_level = hierarchy.levels[-1]
+        S_top = top_level.S
+        U = num_paths_top
 
-    if U > 0:
-        B_paths_alpha = jnp.full((U, U), alpha_B_paths, dtype=jnp.float32)
-        E_paths_alpha = jnp.full((U,), alpha_E_paths, dtype=jnp.float32)
-
-        if top_level.B_states_paths is not None:
-            S_top = top_level.S
-            B_states_paths_alpha = jnp.full(
-                (U, S_top, S_top),
-                alpha_B_states_paths,
-                dtype=jnp.float32,
-            )
-        else:
-            B_states_paths_alpha = None
+        B_states_paths_alpha = jnp.full(
+            (S_top, S_top, U), alpha_B, dtype=jnp.float32
+        )
+        B_paths_alpha = jnp.full((U, U), alpha_B, dtype=jnp.float32)
+        E_paths_alpha = jnp.full((U,), alpha_E, dtype=jnp.float32)
     else:
+        B_states_paths_alpha = None
         B_paths_alpha = None
         E_paths_alpha = None
-        B_states_paths_alpha = None
 
-    return LorenzRGMParams(
-        A_alpha=A_alpha,
-        B_alpha=B_alpha,
-        E_alpha=E_alpha,
+    params = LorenzRGMParams(
+        A_alpha=A_alpha_list,
+        B_alpha=B_alpha_list,
+        E_alpha=E_alpha_list,
         C_alpha=C_alpha,
         B_states_paths_alpha=B_states_paths_alpha,
         B_paths_alpha=B_paths_alpha,
         E_paths_alpha=E_paths_alpha,
     )
 
+    return params
 
-# -----------------------------------------------------------------------------
-# Helper: build hierarchy from learned Dirichlet parameters
-# -----------------------------------------------------------------------------
 
 def build_lorenz_hierarchy_from_params(
     lorenz_spatial_hierarchy: Dict[str, Any],
@@ -464,110 +397,117 @@ def build_lorenz_hierarchy_from_params(
     num_paths_top: int,
 ) -> LorenzHierarchy:
     """
-    Rebuild a LorenzHierarchy using learned Dirichlet parameters for A/B/E
-    at each level, plus the fixed spatial hierarchy and D matrices, and
-    learned path dynamics at the top level.
+    Build a LorenzHierarchy from spatial structure and Dirichlet parameters.
+
+    This converts Dirichlet parameters into categorical A, B, E, C and (if
+    available) path-related B_states_paths, B_paths, E_paths, then constructs
+    LorenzLevel objects consistent with the spatial RG hierarchy.
 
     Args:
-        lorenz_spatial_hierarchy: dict from build_lorenz_spatial_hierarchy
-        params: LorenzRGMParams with A_alpha, B_alpha, E_alpha, C_alpha,
-                and optionally B_states_paths_alpha, B_paths_alpha,
-                E_paths_alpha for the top level.
-        num_paths_top: number of paths at the top level
+        lorenz_spatial_hierarchy: output of build_lorenz_spatial_hierarchy
+        params: LorenzRGMParams with current alphas
+        num_paths_top: number of path states at top level
 
     Returns:
-        LorenzHierarchy with A/B/E normalized from alphas, D from
-        lorenz_spatial_hierarchy, and path factor at top level.
+        LorenzHierarchy
     """
-    # Normalize A, B, E from alphas
-    A_list: List[jnp.ndarray] = []
-    B_list: List[jnp.ndarray] = []
-    E_list: List[jnp.ndarray] = []
-
-    for A_alpha_l, B_alpha_l, E_alpha_l in zip(
-        params.A_alpha, params.B_alpha, params.E_alpha
-    ):
-        if A_alpha_l.size > 0:
-            A_l = A_alpha_l / (A_alpha_l.sum(axis=1, keepdims=True) + 1e-8)
-        else:
-            A_l = A_alpha_l
-
-        B_l = B_alpha_l / (B_alpha_l.sum(axis=1, keepdims=True) + 1e-8)
-        E_l = E_alpha_l / (E_alpha_l.sum() + 1e-8)
-
-        A_list.append(A_l)
-        B_list.append(B_l)
-        E_list.append(E_l)
-
     levels: List[LorenzLevel] = []
     states_grids: List[jnp.ndarray] = []
 
-    # Level 0
-    level0_states_grid = lorenz_spatial_hierarchy["levels"][0]["states_grid"]
-    states_grids.append(level0_states_grid)
+    T = int(lorenz_spatial_hierarchy.get("T"))
     H0 = int(lorenz_spatial_hierarchy["H_blocks"])
     W0 = int(lorenz_spatial_hierarchy["W_blocks"])
-    T = int(lorenz_spatial_hierarchy.get("T", level0_states_grid.shape[0]))
 
-    A0 = A_list[0]
-    B0 = B_list[0]
-    E0 = E_list[0]
-    S0 = A0.shape[0]
+    A_alpha_list = params.A_alpha
+    B_alpha_list = params.B_alpha
+    E_alpha_list = params.E_alpha
+
+    # Normalize path-related alphas if present
+    if params.B_states_paths_alpha is not None and num_paths_top > 0:
+        B_states_paths = params.B_states_paths_alpha / (
+            params.B_states_paths_alpha.sum(axis=0, keepdims=True) + 1e-8
+        )  # (S_top, S_top, U)
+    else:
+        B_states_paths = None
+
+    if params.B_paths_alpha is not None and params.E_paths_alpha is not None and num_paths_top > 0:
+        B_paths = params.B_paths_alpha / (
+            params.B_paths_alpha.sum(axis=0, keepdims=True) + 1e-8
+        )  # (U, U) column-normalized
+        E_paths = params.E_paths_alpha / (params.E_paths_alpha.sum() + 1e-8)
+    else:
+        B_paths, E_paths = None, None
+
+    # ----- Level 0 -----
+    level0_states_grid = lorenz_spatial_hierarchy["levels"][0]["states_grid"]
+    states_grids.append(level0_states_grid)
+
+    A0_alpha = A_alpha_list[0]
+    B0_alpha = B_alpha_list[0]
+    E0_alpha = E_alpha_list[0]
+
+    if A0_alpha.size > 0:
+        A0 = A0_alpha / (A0_alpha.sum(axis=1, keepdims=True) + 1e-8)
+    else:
+        A0 = A0_alpha
+
+    B0 = B0_alpha / (B0_alpha.sum(axis=0, keepdims=True) + 1e-8)  # (S0, S0)
+    E0 = E0_alpha / (E0_alpha.sum() + 1e-8)
+
+    B0_full = B0[:, :, None]  # (S0, S0, 1)
 
     level0 = LorenzLevel(
-        S=S0,
+        S=B0.shape[0],
         A=A0,
         B_states=B0,
         E_states=E0,
         D=None,
-        num_paths=0,
+        num_paths=1,
         B_paths=None,
         E_paths=None,
-        B_states_paths=None,
+        B_states_paths=B0_full,
     )
     levels.append(level0)
 
-    # Level 1 (spatial parent)
-    spatial_level1 = lorenz_spatial_hierarchy["levels"][1]
-    states_grid1 = spatial_level1["states_grid"]
-    D1 = spatial_level1["D"]  # (S1, 4)
-    states_grids.append(states_grid1)
+    # ----- Higher levels (currently just level 1, but extendable) -----
+    if len(lorenz_spatial_hierarchy["levels"]) > 1 and len(A_alpha_list) > 1:
+        # Level 1
+        spatial_level1 = lorenz_spatial_hierarchy["levels"][1]
+        states_grid1 = spatial_level1["states_grid"]
+        D1 = spatial_level1["D"]  # (S1, 4)
+        states_grids.append(states_grid1)
 
-    A1 = A_list[1]
-    B1 = B_list[1]
-    E1 = E_list[1]
-    S1 = B1.shape[0]
+        A1_alpha = A_alpha_list[1]
+        B1_alpha = B_alpha_list[1]
+        E1_alpha = E_alpha_list[1]
 
-    # Path-related learned parameters
-    if num_paths_top > 0 and params.B_paths_alpha is not None and params.E_paths_alpha is not None:
-        B_paths = params.B_paths_alpha / (
-            params.B_paths_alpha.sum(axis=1, keepdims=True) + 1e-8
+        if A1_alpha.size > 0:
+            A1 = A1_alpha / (A1_alpha.sum(axis=1, keepdims=True) + 1e-8)
+        else:
+            A1 = A1_alpha
+
+        B1 = B1_alpha / (B1_alpha.sum(axis=0, keepdims=True) + 1e-8)
+        E1 = E1_alpha / (E1_alpha.sum() + 1e-8)
+
+        B1_full = B1[:, :, None]  # (S1, S1, 1)
+
+        # At this stage (2-level spatial hierarchy), we do NOT attach paths here.
+        level1 = LorenzLevel(
+            S=B1.shape[0],
+            A=A1,
+            B_states=B1,
+            E_states=E1,
+            D=D1,
+            num_paths=1,
+            B_paths=None,
+            E_paths=None,
+            B_states_paths=B1_full,
         )
-        E_paths = params.E_paths_alpha / (params.E_paths_alpha.sum() + 1e-8)
-    else:
-        B_paths, E_paths = build_path_dynamics(num_paths_top)
+        levels.append(level1)
 
-    if num_paths_top > 0 and params.B_states_paths_alpha is not None:
-        # Normalize per u over s' axis
-        B_states_paths = params.B_states_paths_alpha / (
-            params.B_states_paths_alpha.sum(axis=2, keepdims=True) + 1e-8
-        )
-    else:
-        B_states_paths = build_path_dependent_B_states(S1, num_paths_top, self_bias=1.0) \
-            if num_paths_top > 0 else None
-
-    level1 = LorenzLevel(
-        S=S1,
-        A=A1,
-        B_states=B1,
-        E_states=E1,
-        D=D1,
-        num_paths=num_paths_top,
-        B_paths=B_paths,
-        E_paths=E_paths,
-        B_states_paths=B_states_paths,
-    )
-    levels.append(level1)
+    # NOTE: In the eventual 3-level design, a third level (top) will be added
+    # here, with num_paths = num_paths_top, B_states_paths from the normalized
+    # B_states_paths above, and B_paths/E_paths for path dynamics.
 
     hierarchy = LorenzHierarchy(
         levels=levels,
@@ -576,4 +516,5 @@ def build_lorenz_hierarchy_from_params(
         H_blocks=H0,
         W_blocks=W0,
     )
+
     return hierarchy
