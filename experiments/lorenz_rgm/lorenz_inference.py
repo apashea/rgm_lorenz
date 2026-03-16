@@ -354,9 +354,11 @@ def vmp_two_level_states(
 
     # ----- Level-1 update: per-site chains of length T, with path-dependent B1 -----
 
-    def update_level1(qs0_grid_current: jnp.ndarray,
-                      qs1_grid_current: jnp.ndarray,
-                      qu_current: Optional[jnp.ndarray]) -> jnp.ndarray:
+    def update_level1(
+        qs0_grid_current: jnp.ndarray,
+        qs1_grid_current: jnp.ndarray,
+        qu_current: Optional[jnp.ndarray],
+    ) -> jnp.ndarray:
         log_lik1 = bottom_up_message_level0_to_level1(qs0_grid_current, D1, states_grid1)
         # log_lik1: (T, H1, W1, S1)
 
@@ -372,9 +374,11 @@ def vmp_two_level_states(
             # No path dependence: same B1 at all times
             B_eff_all = jnp.broadcast_to(B1, (T, S1, S1))
 
-        def update_site_chain(qs1_chain: jnp.ndarray,
-                              log_lik_chain: jnp.ndarray,
-                              B_eff_chain: jnp.ndarray) -> jnp.ndarray:
+        def update_site_chain(
+            qs1_chain: jnp.ndarray,
+            log_lik_chain: jnp.ndarray,
+            B_eff_chain: jnp.ndarray,
+        ) -> jnp.ndarray:
             """
             qs1_chain:    (T, S1)
             log_lik_chain:(T, S1)
@@ -416,40 +420,37 @@ def vmp_two_level_states(
             qs_final = jax.lax.fori_loop(0, 2, body_fun, qs_init)
             return qs_final
 
-        # Broadcast B_eff_all over spatial sites
-        # B_eff_all: (T, S1, S1) -> (T, H1, W1, S1, S1)
-        B_eff_grid = jnp.broadcast_to(
-            B_eff_all[:, None, None, :, :],
-            (T, H1, W1, S1, S1),
-        )
+        # vmap over spatial sites; B_eff_all is (T, S1, S1) shared across sites
 
-        # vmap over spatial sites (H1, W1), each with a (T, S1) chain
-        def update_site(h_idx, w_idx, qs1_grid_current, log_lik1, B_eff_grid):
-            qs1_chain = qs1_grid_current[:, h_idx, w_idx, :]      # (T, S1)
-            log_lik_chain = log_lik1[:, h_idx, w_idx, :]          # (T, S1)
-            B_eff_chain = B_eff_grid[:, h_idx, w_idx, :, :]       # (T, S1, S1)
+        H1, W1 = qs1_grid_current.shape[1], qs1_grid_current.shape[2]
+        h_indices = jnp.arange(H1)
+        w_indices = jnp.arange(W1)
+
+        def update_site(h_idx, w_idx, qs1_grid_current, log_lik1, B_eff_all):
+            qs1_chain = qs1_grid_current[:, h_idx, w_idx, :]   # (T, S1)
+            log_lik_chain = log_lik1[:, h_idx, w_idx, :]       # (T, S1)
+            B_eff_chain = B_eff_all                            # (T, S1, S1)
             return update_site_chain(qs1_chain, log_lik_chain, B_eff_chain)
 
-        # vmaps over H1, W1
-        update_sites_vmap = jax.vmap(
-            jax.vmap(
-                lambda qs1_ch, log_lik_ch, B_eff_ch: update_site_chain(
-                    qs1_ch, log_lik_ch, B_eff_ch
-                ),
-                in_axes=(1, 1, 1),
-                out_axes=1,
-            ),
-            in_axes=(1, 1, 1),
-            out_axes=1,
-        )
+        def update_row(h_idx, qs1_grid_current, log_lik1, B_eff_all):
+            return jax.vmap(
+                lambda w_idx: update_site(h_idx, w_idx, qs1_grid_current, log_lik1, B_eff_all)
+            )(w_indices)  # (W1, T, S1)
 
-        qs1_grid_new = update_sites_vmap(qs1_grid_current, log_lik1, B_eff_all)
+        qs1_rows = jax.vmap(
+            lambda h_idx: update_row(h_idx, qs1_grid_current, log_lik1, B_eff_all)
+        )(h_indices)  # (H1, W1, T, S1)
+
+        # Rearrange to (T, H1, W1, S1)
+        qs1_grid_new = jnp.transpose(qs1_rows, (2, 0, 1, 3))
         return qs1_grid_new
 
     # ----- Level-0 update: per-patch chains with top-down bias -----
 
-    def update_level0(qs0_grid_current: jnp.ndarray,
-                      qs1_grid_current: jnp.ndarray) -> jnp.ndarray:
+    def update_level0(
+        qs0_grid_current: jnp.ndarray,
+        qs1_grid_current: jnp.ndarray,
+    ) -> jnp.ndarray:
         H1, W1 = qs1_grid_current.shape[1], qs1_grid_current.shape[2]
 
         def build_topdown_prior() -> jnp.ndarray:
@@ -480,8 +481,10 @@ def vmp_two_level_states(
 
         log_prior_bias0 = build_topdown_prior()  # (T, H0, W0, S0)
 
-        def update_site_chain(qs0_chain: jnp.ndarray,
-                              log_bias_chain: jnp.ndarray) -> jnp.ndarray:
+        def update_site_chain(
+            qs0_chain: jnp.ndarray,
+            log_bias_chain: jnp.ndarray,
+        ) -> jnp.ndarray:
             """
             qs0_chain:    (T, S0)
             log_bias_chain:(T, S0)
