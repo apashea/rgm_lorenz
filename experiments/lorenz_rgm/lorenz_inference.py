@@ -40,8 +40,12 @@ def build_lowest_level_observations_flat(
     """
     Build a flat observation array suitable for lowest-level inference.
 
-    We treat the quantized coefficients as one-hot observations that match A.
-    Returns obs_flat: (N, O) where N = T * H_blocks * W_blocks, O = K * L.
+    We treat the quantized coefficients as "observations" in a one-hot form
+    that is consistent with the A built in lorenz_model.py.
+
+    Returns:
+        obs_flat: (N, O) array, where N = T * H_blocks * W_blocks,
+                  O = K * L.
     """
     q_coeffs = lorenz_data_dict["q_coeffs"]  # (N, K)
     K = int(lorenz_data_dict["K"])
@@ -70,13 +74,15 @@ def build_lowest_level_observations_grid(
     lorenz_data_dict: Dict[str, Any],
 ) -> jnp.ndarray:
     """
-    Reshape observations as (T, H0, W0, O) for patch-wise inference.
+    Build an observation array reshaped as (T, H0, W0, O) for patch-wise
+    inference.
     """
     obs_flat = build_lowest_level_observations_flat(lorenz_data_dict)  # (N, O)
     T = int(lorenz_data_dict["T"])
     H0 = int(lorenz_data_dict["H_blocks"])
     W0 = int(lorenz_data_dict["W_blocks"])
     O = obs_flat.shape[1]
+
     obs_grid = obs_flat.reshape(T, H0, W0, O)
     return obs_grid
 
@@ -111,13 +117,14 @@ def vmp_single_chain(
     num_iter: int = 8,
 ) -> jnp.ndarray:
     """
-    VMP for a single chain with emission A, transition B, prior E.
+    Variational message passing for a single chain of hidden states.
 
     Args:
         A: (S, O)
         B: (S, S)
         E: (S,)
         obs: (T, O)
+
     Returns:
         qs: (T, S)
     """
@@ -214,7 +221,7 @@ def bottom_up_message_level0_to_level1(
     states_grid1: jnp.ndarray,
 ) -> jnp.ndarray:
     """
-    Compute bottom-up pseudo-likelihood for each Level-1 state from Level-0 posteriors.
+    Bottom-up pseudo-likelihood from Level 0 to Level 1 via D.
 
     Args:
         qs0_grid: (T, H0, W0, S0)
@@ -291,7 +298,7 @@ def vmp_two_level_states(
     B1 = level1.B_states
     E1 = level1.E_states
     D1 = level1.D
-    # IMPORTANT: in the current model, B_states_paths has shape (S1, S1, U)
+    # Current model: B_states_paths has shape (S1, S1, U)
     B_states_paths = level1.B_states_paths  # (S1, S1, U) or None
 
     T, H0, W0, S0 = qs0_grid.shape
@@ -307,7 +314,7 @@ def vmp_two_level_states(
         U = 0
         qu_top_eff = None
     else:
-        U = B_states_paths.shape[2]  # last axis is U
+        U = B_states_paths.shape[2]
         if qu_top is None:
             qu_top_eff = jnp.full((T, U), 1.0 / U, dtype=jnp.float32)
         else:
@@ -328,8 +335,7 @@ def vmp_two_level_states(
             # B_states_paths: (S1, S1, U), qu_current: (T, U)
             def B_eff_for_time(t):
                 qu_t = qu_current[t]  # (U,)
-                # (S1, S1, U) * (1,1,U) -> (S1, S1, U), sum over U -> (S1, S1)
-                return (B_states_paths * qu_t[None, None, :]).sum(axis=2)
+                return (B_states_paths * qu_t[None, None, :]).sum(axis=2)  # (S1, S1)
 
             B_eff_all = jax.vmap(B_eff_for_time)(jnp.arange(T))  # (T, S1, S1)
         else:
@@ -498,7 +504,7 @@ def vmp_two_level_states(
 
     def alt_step(_, carry):
         qs0_c, qs1_c = carry
-        qs1_new = update_level1(qs0_c, qs1_c, qu_top_eff)
+        qs1_new = update_level1(qs0_c, qs1_c, qu_top_eff if "qu_top_eff" in locals() else None)
         qs0_new = update_level0(qs0_c, qs1_new)
         return (qs0_new, qs1_new)
 
@@ -521,10 +527,10 @@ def infer_lorenz_hierarchy(
     pref_mode: str = "data_empirical",
 ) -> Dict[str, Any]:
     """
-    Run variational inference over states and paths in the Lorenz hierarchy.
+    Run variational inference over states and (optional) paths in the Lorenz hierarchy.
 
-    Returns:
-        dict with "qs_levels" and "qu_levels".
+    If the top level has a proper path factor (num_paths > 1 and B_paths/E_paths
+    are not None), we run EFE-based path inference; otherwise we only infer states.
     """
     T = hierarchy.T
     H0 = hierarchy.H_blocks
@@ -558,7 +564,16 @@ def infer_lorenz_hierarchy(
         top_idx = len(hierarchy.levels) - 1
         level_top = hierarchy.levels[top_idx]
 
-        if level_top.num_paths > 0:
+        # Only treat paths as active if we have a full path factor:
+        # more than one path and both B_paths and E_paths defined.
+        paths_active = (
+            level_top.num_paths is not None
+            and level_top.num_paths > 1
+            and level_top.B_paths is not None
+            and level_top.E_paths is not None
+        )
+
+        if paths_active:
             U = level_top.num_paths
             qu_top = jnp.full((T, U), 1.0 / U, dtype=jnp.float32)
         else:
@@ -581,7 +596,7 @@ def infer_lorenz_hierarchy(
                 num_iter=1,
             )
 
-            if level_top.num_paths > 0:
+            if paths_active:
                 G_tu = compute_expected_free_energy_paths(
                     level_top,
                     level0,
