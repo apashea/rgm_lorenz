@@ -3,16 +3,11 @@
 Learning routines for the Lorenz RGM.
 
 This module implements:
-- Accumulation of Dirichlet counts for A, E_states, and preferences C
-  from posterior beliefs over states and observations.
+- Accumulation of Dirichlet counts for A, E_states, and preferences from
+  posterior beliefs over states and observations.
 - Updates of Dirichlet concentration parameters stored in LorenzRGMParams:
     * A_alpha[l], E_states_alpha[l], pref_alpha
-    * (optionally) B_states_paths_alpha[l], C_paths_alpha[l],
-      E_paths_alpha[l], E_paths_from_parent_alpha[l]
-- Accumulation and updates for path-related Dirichlet parameters:
-    * B_states_paths_alpha: path-dependent state transitions
-    * C_paths_alpha: path transition dynamics
-    * E_paths_alpha: initial path priors
+    * (optionally) B_states_paths_alpha[l], C_paths_alpha[l], E_paths_alpha[l]
 - A training loop scaffold that alternates between inference and parameter
   updates over one or more Lorenz trajectories.
 
@@ -25,7 +20,7 @@ Conventions (aligned with lorenz_model.py, lorenz_inference.py, lorenz_efe.py):
   with shape (S, S, U).
 
 - The corresponding Dirichlet parameters B_states_paths_alpha[l] have the same
-  shape, and are normalized over the s_next axis (axis=0) for each (s, u)
+  shape and are normalized over the s_next axis (axis=0) for each (s, u)
   when converting to categorical probabilities.
 """
 
@@ -46,7 +41,7 @@ from .lorenz_inference import (
 )
 
 # -----------------------------------------------------------------------------
-# 1. Sufficient statistics for lowest level (A0, E_states0, C0)
+# 1. Sufficient statistics for lowest level (A0, E_states^0, preferences)
 # -----------------------------------------------------------------------------
 
 def accumulate_A_counts_level0(
@@ -83,7 +78,7 @@ def accumulate_E_states_counts_level0(
       qs0_grid: (T, H0, W0, S0)
 
     Returns:
-      dE_states0: (S0,)
+      dE0: (S0,)
     """
     q0 = qs0_grid[0]  # (H0, W0, S0)
     H0, W0, S0 = q0.shape
@@ -107,7 +102,6 @@ def accumulate_pref_counts(
     dC0 = obs_grid.sum(axis=(0, 1, 2))
     return dC0
 
-
 # -----------------------------------------------------------------------------
 # 2. Sufficient statistics for higher-level E_states
 # -----------------------------------------------------------------------------
@@ -129,7 +123,6 @@ def accumulate_E_states_counts_level(
     q0_flat = q0.reshape(H * W, S)
     dE = q0_flat.sum(axis=0)
     return dE
-
 
 # -----------------------------------------------------------------------------
 # 3. Sufficient statistics for path-dependent transitions and paths
@@ -185,7 +178,7 @@ def accumulate_C_E_paths(
     Accumulate Dirichlet counts for path transitions C_paths and E_paths.
 
     Args:
-      qu: (T, U) path posterior at a given level
+      qu: (T, U)
 
     Returns:
       dC_paths: (U, U)
@@ -198,7 +191,6 @@ def accumulate_C_E_paths(
     dC_paths = qu_t.T @ qu_t1
     dE_paths = qu[0]
     return dC_paths, dE_paths
-
 
 # -----------------------------------------------------------------------------
 # 4. Update Dirichlet parameters from a single sequence
@@ -229,7 +221,7 @@ def update_dirichlet_from_sequence(
     Returns:
       Updated LorenzRGMParams
     """
-    # 1. Observations as grid (for A0 and preferences)
+    # 1. Observations as grid
     obs_grid = build_lowest_level_observations_grid(lorenz_data_dict)  # (T0, H0, W0, O0)
 
     # 2. Inference
@@ -249,7 +241,7 @@ def update_dirichlet_from_sequence(
     qs1_grid = qs_levels[1] if len(qs_levels) > 1 else None
     qu_top = qu_levels[-1] if len(qu_levels) > 1 else None
 
-    # 3. Level 0 counts (A0, E_states0, preferences)
+    # 3. Level 0 counts
     dA0 = accumulate_A_counts_level0(qs0_grid, obs_grid)
     dE0 = accumulate_E_states_counts_level0(qs0_grid)
     dC0 = accumulate_pref_counts(obs_grid)
@@ -286,7 +278,6 @@ def update_dirichlet_from_sequence(
 
     return params
 
-
 # -----------------------------------------------------------------------------
 # 5. Training loop scaffold
 # -----------------------------------------------------------------------------
@@ -319,14 +310,14 @@ def train_lorenz_rgm(
       initial_params: initial Dirichlet parameters
       lorenz_spatial_hierarchy: spatial hierarchy (states_grids, D tensors)
       build_data_fn: callable returning a lorenz_data_dict
-      K, L: lowest-level configuration (for consistency checks)
+      K, L: lowest-level configuration
       T0, K0, K1: temporal structure
-      num_epochs: number of passes over data
-      num_sequences_per_epoch: number of sequences per epoch
-      num_iter_lowest: iterations of lowest-level VMP
-      num_iter_hier: iterations of hierarchical VMP
+      num_epochs: number of epochs
+      num_sequences_per_epoch: sequences per epoch
+      num_iter_lowest: iterations at lowest level
+      num_iter_hier: iterations at higher level
       efe_gamma: precision over EFE
-      pref_mode: preference mode ("data_empirical" or "uniform")
+      pref_mode: preference mode
 
     Returns:
       Trained LorenzRGMParams
@@ -356,7 +347,6 @@ def train_lorenz_rgm(
             )
 
     return params
-
 
 # -----------------------------------------------------------------------------
 # 6. Convenience wrapper: single-hierarchy training (used by notebook)
