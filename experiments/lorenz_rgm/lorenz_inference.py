@@ -7,15 +7,16 @@ This module provides:
   kernel, and E_states.
 - Patch-wise lowest-level inference by looping over patches and calling
   the single-chain VMP (to keep memory usage manageable).
-- Two-level state inference with spatial renormalization:
-  * bottom-up messages from level 0 to level 1 via D
-  * top-down messages from level 1 to level 0 via D
+- Multi-level state inference with spatial renormalization:
+  * bottom-up messages from level 0 to level 1 via D_state_from_parent
+  * bottom-up messages from level 1 to level 2 via D_state_from_parent
+  * top-down messages from parent to child via D_state_from_parent
 - Top-level path inference using expected free energy over paths
   computed via lorenz_efe (risk + ambiguity - epistemic), with
   path-dependent transitions B_states_paths at the top state level.
 
 This is a Lorenz-specific instance of RGM-style inference and is structured
-to be extended further for full RGM behaviour.
+to realize the RGM-style pixels-to-planning architecture.
 """
 
 from typing import List, Dict, Any, Tuple, Optional
@@ -79,12 +80,12 @@ def build_lowest_level_observations_grid(
     inference.
     """
     obs_flat = build_lowest_level_observations_flat(lorenz_data_dict)  # (N, O)
-    T = int(lorenz_data_dict["T"])
+    T0 = int(lorenz_data_dict["T"])
     H0 = int(lorenz_data_dict["H_blocks"])
     W0 = int(lorenz_data_dict["W_blocks"])
     O = obs_flat.shape[1]
 
-    obs_grid = obs_flat.reshape(T, H0, W0, O)
+    obs_grid = obs_flat.reshape(T0, H0, W0, O)
     return obs_grid
 
 
@@ -194,21 +195,20 @@ def infer_lowest_level_patches(
     to higher levels.
 
     Returns:
-      qs0_grid: (T, H0, W0, S0)
+      qs0_grid: (T0, H0, W0, S0)
     """
     A0 = level0.A
     E0 = level0.E_states
 
-    obs_grid = build_lowest_level_observations_grid(lorenz_data_dict)  # (T, H0, W0, O)
-    T, H0, W0, O = obs_grid.shape
+    obs_grid = build_lowest_level_observations_grid(lorenz_data_dict)  # (T0, H0, W0, O)
+    T0, H0, W0, _ = obs_grid.shape
     S0 = A0.shape[0]
 
-    # Simple persistence kernel at level 0
     B0 = jnp.eye(S0, dtype=jnp.float32)
 
     vmp_single_chain_jit = jax.jit(vmp_single_chain, static_argnames=("num_iter",))
 
-    qs0_host = np.zeros((T, H0, W0, S0), dtype=np.float32)
+    qs0_host = np.zeros((T0, H0, W0, S0), dtype=np.float32)
 
     for h0 in range(H0):
         for w0 in range(W0):
@@ -220,160 +220,203 @@ def infer_lowest_level_patches(
     return qs0_grid
 
 # -----------------------------------------------------------------------------
-# 4. Two-level hierarchical state inference via D (with path-dependent B1)
+# 4. Bottom-up and top-down messages via D_state_from_parent
 # -----------------------------------------------------------------------------
 
-def bottom_up_message_level0_to_level1(
-    qs0_grid: jnp.ndarray,
-    D1: jnp.ndarray,
-    states_grid1: jnp.ndarray,
+def bottom_up_message_child_to_parent(
+    qs_child_grid: jnp.ndarray,
+    D_parent: jnp.ndarray,
+    states_grid_parent: jnp.ndarray,
 ) -> jnp.ndarray:
     """
-    Bottom-up pseudo-likelihood from Level 0 to Level 1 via D.
+    Bottom-up pseudo-likelihood from a child level to a parent level via D.
 
     Args:
-      qs0_grid: (T, H0, W0, S0)
-      D1: (S1, 4) integer child-state indices per parent state
-      states_grid1: (T, H1, W1)
+      qs_child_grid: (T, H_child, W_child, S_child)
+      D_parent: (S_parent, 4) integer child-state indices per parent state
+      states_grid_parent: (T, H_parent, W_parent)
 
     Returns:
-      log_lik1: (T, H1, W1, S1)
+      log_lik_parent: (T, H_parent, W_parent, S_parent)
     """
-    T, H0, W0, S0 = qs0_grid.shape
-    T1, H1, W1 = states_grid1.shape
+    T, Hc, Wc, S_child = qs_child_grid.shape
+    T1, Hp, Wp = states_grid_parent.shape
     assert T == T1
-    assert H0 == 2 * H1 and W0 == 2 * W1
+    assert Hc == 2 * Hp and Wc == 2 * Wp
 
-    S1 = D1.shape[0]
+    S_parent = D_parent.shape[0]
 
-    def site_children(qs0_t: jnp.ndarray) -> jnp.ndarray:
-        c00 = qs0_t[0::2, 0::2, :]
-        c01 = qs0_t[0::2, 1::2, :]
-        c10 = qs0_t[1::2, 0::2, :]
-        c11 = qs0_t[1::2, 1::2, :]
-        return jnp.stack([c00, c01, c10, c11], axis=2)  # (H1, W1, 4, S0)
+    def site_children(qs_child_t: jnp.ndarray) -> jnp.ndarray:
+        c00 = qs_child_t[0::2, 0::2, :]
+        c01 = qs_child_t[0::2, 1::2, :]
+        c10 = qs_child_t[1::2, 0::2, :]
+        c11 = qs_child_t[1::2, 1::2, :]
+        return jnp.stack([c00, c01, c10, c11], axis=2)  # (Hp, Wp, 4, S_child)
 
-    qs0_children = jax.vmap(site_children)(qs0_grid)  # (T, H1, W1, 4, S0)
-    D1_indices = D1.astype(jnp.int32)  # (S1, 4)
+    qs_children = jax.vmap(site_children)(qs_child_grid)  # (T, Hp, Wp, 4, S_child)
+    D_idx = D_parent.astype(jnp.int32)  # (S_parent, 4)
 
-    def score_parent_state(qs0_child: jnp.ndarray, pattern: jnp.ndarray) -> jnp.ndarray:
-        probs = qs0_child[jnp.arange(4), pattern]  # (4,)
+    def score_parent_state(qs_child_patch: jnp.ndarray, pattern: jnp.ndarray) -> jnp.ndarray:
+        probs = qs_child_patch[jnp.arange(4), pattern]  # (4,)
         log_probs = jnp.log(jnp.clip(probs, 1e-16))
         return log_probs.sum()
 
-    def score_all_parents_for_site(qs0_child_site: jnp.ndarray) -> jnp.ndarray:
+    def score_all_parents_for_site(qs_child_site: jnp.ndarray) -> jnp.ndarray:
         return jax.vmap(
-            lambda pattern: score_parent_state(qs0_child_site, pattern)
-        )(D1_indices)
+            lambda pattern: score_parent_state(qs_child_site, pattern)
+        )(D_idx)  # (S_parent,)
 
-    def score_all_sites(qs0_children_t: jnp.ndarray) -> jnp.ndarray:
+    def score_all_sites(qs_children_t: jnp.ndarray) -> jnp.ndarray:
         def score_site(children_site: jnp.ndarray) -> jnp.ndarray:
             return score_all_parents_for_site(children_site)
 
-        return jax.vmap(jax.vmap(score_site, in_axes=0), in_axes=0)(qs0_children_t)
+        return jax.vmap(jax.vmap(score_site, in_axes=0), in_axes=0)(qs_children_t)
 
-    log_lik1 = jax.vmap(score_all_sites)(qs0_children)  # (T, H1, W1, S1)
-    return log_lik1
+    log_lik_parent = jax.vmap(score_all_sites)(qs_children)  # (T, Hp, Wp, S_parent)
+    return log_lik_parent
 
 
-def vmp_two_level_states(
-    level0: LorenzLevel,
-    level1: LorenzLevel,
-    qs0_grid: jnp.ndarray,
-    states_grid1: jnp.ndarray,
-    qu_top: Optional[jnp.ndarray] = None,
-    num_iter: int = 4,
-) -> Tuple[jnp.ndarray, jnp.ndarray]:
+def top_down_prior_parent_to_child(
+    qs_parent_grid: jnp.ndarray,
+    D_parent: jnp.ndarray,
+    H_child: int,
+    W_child: int,
+    S_child: int,
+) -> jnp.ndarray:
     """
-    Coupled VMP over Level-0 and Level-1 states with path-dependent B1 at top.
+    Build a top-down log prior bias over child states from parent posteriors
+    using D_state_from_parent.
 
     Args:
-      level0: lowest-level LorenzLevel
-      level1: parent-level LorenzLevel
-      qs0_grid: (T, H0, W0, S0)
-      states_grid1: (T, H1, W1)
-      qu_top: (T, U) or None (path posterior at the level that has paths)
+      qs_parent_grid: (T, Hp, Wp, S_parent)
+      D_parent: (S_parent, 4) mapping parent->child states
+      H_child, W_child, S_child: child grid sizes
+
+    Returns:
+      log_prior_bias_child: (T, H_child, W_child, S_child)
+    """
+    T, Hp, Wp, S_parent = qs_parent_grid.shape
+    assert H_child == 2 * Hp and W_child == 2 * Wp
+
+    D_idx = D_parent.astype(jnp.int32)  # (S_parent, 4)
+
+    def bias_for_time(t):
+        qs_parent_t = qs_parent_grid[t]  # (Hp, Wp, S_parent)
+        bias = jnp.zeros((H_child, W_child, S_child), dtype=jnp.float32)
+
+        for hp in range(Hp):
+            for wp in range(Wp):
+                qs_p = qs_parent_t[hp, wp]  # (S_parent,)
+                for child_idx, (dh, dw) in enumerate(
+                    [(0, 0), (0, 1), (1, 0), (1, 1)]
+                ):
+                    hc = 2 * hp + dh
+                    wc = 2 * wp + dw
+                    child_states = D_idx[:, child_idx]  # (S_parent,)
+                    accum = jnp.zeros((S_child,), dtype=jnp.float32)
+
+                    def body_fun(sp, acc):
+                        sc = child_states[sp]
+                        return acc.at[sc].add(qs_p[sp])
+
+                    accum = jax.lax.fori_loop(0, S_parent, body_fun, accum)
+                    accum = accum / (accum.sum() + 1e-8)
+                    log_accum = jnp.log(jnp.clip(accum, 1e-16))
+                    bias = bias.at[hc, wc, :].set(log_accum)
+        return bias
+
+    log_prior_bias_child = jax.vmap(bias_for_time)(jnp.arange(T))  # (T, Hc, Wc, S_child)
+    return log_prior_bias_child
+
+# -----------------------------------------------------------------------------
+# 5. Two-level VMP building block (child-parent)
+# -----------------------------------------------------------------------------
+
+def vmp_two_level_states(
+    level_child: LorenzLevel,
+    level_parent: LorenzLevel,
+    qs_child_grid: jnp.ndarray,
+    states_grid_parent: jnp.ndarray,
+    qu_parent: Optional[jnp.ndarray] = None,
+    num_iter: int = 2,
+) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """
+    Coupled VMP over child and parent states with optional path-dependent
+    dynamics at the parent level.
+
+    Args:
+      level_child: lower LorenzLevel
+      level_parent: parent LorenzLevel
+      qs_child_grid: (T, Hc, Wc, S_child)
+      states_grid_parent: (T, Hp, Wp)
+      qu_parent: (T, U) or None (path posterior at this level)
       num_iter: alternating sweeps
 
     Returns:
-      qs0_final: (T, H0, W0, S0)
-      qs1_final: (T, H1, W1, S1)
+      qs_child_final: (T, Hc, Wc, S_child)
+      qs_parent_final: (T, Hp, Wp, S_parent)
     """
-    E0 = level0.E_states
-    A0 = level0.A
-    S0 = A0.shape[0]
+    E_child = level_child.E_states
+    S_child = E_child.shape[0]
 
-    # Level 1
-    E1 = level1.E_states
-    D1 = level1.D_state_from_parent  # (S1, 4)
-    B_states_paths = level1.B_states_paths  # (S1, S1, U) or None
+    E_parent = level_parent.E_states
+    D_parent = level_parent.D_state_from_parent  # (S_parent, 4)
+    B_states_paths_parent = level_parent.B_states_paths  # (S_parent, S_parent, U) or None
 
-    T, H0, W0, _ = qs0_grid.shape
-    T1, H1, W1 = states_grid1.shape
+    T, Hc, Wc, _ = qs_child_grid.shape
+    T1, Hp, Wp = states_grid_parent.shape
     assert T == T1
-    assert H0 == 2 * H1 and W0 == 2 * W1
+    assert Hc == 2 * Hp and Wc == 2 * Wp
 
-    if D1 is None:
-        raise ValueError("level1 must define D_state_from_parent for two-level inference.")
+    if D_parent is None:
+        raise ValueError("Parent level must define D_state_from_parent.")
 
-    # If no path-specific dynamics are attached to this level, fall back to
-    # a simple identity kernel for B1.
-    if B_states_paths is None:
-        S1 = E1.shape[0]
-        B1 = jnp.eye(S1, dtype=jnp.float32)
-        qu_top_eff = None
+    S_parent = E_parent.shape[0]
+
+    # Effective temporal kernel at parent
+    if B_states_paths_parent is None:
+        B_parent_all = jnp.broadcast_to(jnp.eye(S_parent, dtype=jnp.float32), (T, S_parent, S_parent))
     else:
-        S1 = B_states_paths.shape[0]
-        U = B_states_paths.shape[2]
-        if qu_top is None:
-            qu_top_eff = jnp.full((T, U), 1.0 / U, dtype=jnp.float32)
+        U = B_states_paths_parent.shape[2]
+        if qu_parent is None:
+            qu_parent_eff = jnp.full((T, U), 1.0 / U, dtype=jnp.float32)
         else:
-            qu_top_eff = qu_top
+            qu_parent_eff = qu_parent
 
-        # Path-marginalized B1 per time:
         def B_eff_for_time(t):
-            qu_t = qu_top_eff[t]  # (U,)
-            return (B_states_paths * qu_t[None, None, :]).sum(axis=2)  # (S1, S1)
+            qu_t = qu_parent_eff[t]  # (U,)
+            return (B_states_paths_parent * qu_t[None, None, :]).sum(axis=2)  # (S_parent, S_parent)
 
-        B1_all = jax.vmap(B_eff_for_time)(jnp.arange(T))  # (T, S1, S1)
-        B1 = B1_all
+        B_parent_all = jax.vmap(B_eff_for_time)(jnp.arange(T))  # (T, S_parent, S_parent)
 
-    qs1_grid = jnp.full((T, H1, W1, S1), 1.0 / S1, dtype=jnp.float32)
+    # Initialize parent states uniformly
+    qs_parent_grid = jnp.full((T, Hp, Wp, S_parent), 1.0 / S_parent, dtype=jnp.float32)
 
-    # ----- Level-1 update -----
+    # ----- Alternating updates -----
 
-    def update_level1(
-        qs0_grid_current: jnp.ndarray,
-        qs1_grid_current: jnp.ndarray,
-        qu_current: Optional[jnp.ndarray],
-    ) -> jnp.ndarray:
-        log_lik1 = bottom_up_message_level0_to_level1(
-            qs0_grid_current, D1, states_grid1
-        )  # (T, H1, W1, S1)
-
-        # Effective B1 (either time-dependent or identity)
-        if B_states_paths is not None and qu_current is not None:
-            B_eff_all = B1  # already time-dependent (T, S1, S1)
-        else:
-            B_eff_all = jnp.broadcast_to(jnp.eye(S1, dtype=jnp.float32), (T, S1, S1))
+    def update_parent(qs_child_curr, qs_parent_curr):
+        # bottom-up from child
+        log_lik_parent = bottom_up_message_child_to_parent(
+            qs_child_curr, D_parent, states_grid_parent
+        )  # (T, Hp, Wp, S_parent)
 
         def update_site_chain(
-            qs1_chain: jnp.ndarray,
+            qs_parent_chain: jnp.ndarray,
             log_lik_chain: jnp.ndarray,
-            B_eff_chain: jnp.ndarray,
+            B_chain: jnp.ndarray,
         ) -> jnp.ndarray:
             """
-            qs1_chain: (T, S1)
-            log_lik_chain: (T, S1)
-            B_eff_chain: (T, S1, S1)
+            qs_parent_chain: (T, S_parent)
+            log_lik_chain: (T, S_parent)
+            B_chain: (T, S_parent, S_parent)
             """
 
             def forward_messages(qs_):
                 msgs = []
                 prev_q = qs_[0]
-                msgs.append(jnp.log(jnp.clip(E1, 1e-16)))
+                msgs.append(jnp.log(jnp.clip(E_parent, 1e-16)))
                 for t in range(1, T):
-                    B_t = B_eff_chain[t]
+                    B_t = B_chain[t]
                     msg = jnp.log(jnp.clip(B_t @ prev_q, 1e-16))
                     msgs.append(msg)
                     prev_q = qs_[t]
@@ -384,7 +427,7 @@ def vmp_two_level_states(
                 next_q = qs_[-1]
                 msgs.append(jnp.zeros_like(next_q))
                 for t in range(T - 2, -1, -1):
-                    B_tp1 = B_eff_chain[t + 1]
+                    B_tp1 = B_chain[t + 1]
                     msg = jnp.log(jnp.clip(B_tp1.T @ next_q, 1e-16))
                     msgs.append(msg)
                     next_q = qs_[t]
@@ -400,88 +443,59 @@ def vmp_two_level_states(
             def body_fun(_, qs_):
                 return vmp_iter(qs_)
 
-            qs_init = qs1_chain
+            qs_init = qs_parent_chain
             qs_final = jax.lax.fori_loop(0, 2, body_fun, qs_init)
             return qs_final
 
-        H1_, W1_ = qs1_grid_current.shape[1], qs1_grid_current.shape[2]
-        h_indices = jnp.arange(H1_)
-        w_indices = jnp.arange(W1_)
+        H_p_, W_p_ = qs_parent_curr.shape[1], qs_parent_curr.shape[2]
+        h_idx = jnp.arange(H_p_)
+        w_idx = jnp.arange(W_p_)
 
-        def update_site(h_idx, w_idx, qs1_curr, log_lik1_all, B_all):
-            qs_chain = qs1_curr[:, h_idx, w_idx, :]      # (T, S1)
-            log_chain = log_lik1_all[:, h_idx, w_idx, :] # (T, S1)
-            B_chain = B_all                              # (T, S1, S1)
+        def update_site(h, w, qs_parent_all, log_lik_all, B_all):
+            qs_chain = qs_parent_all[:, h, w, :]      # (T, S_parent)
+            log_chain = log_lik_all[:, h, w, :]       # (T, S_parent)
+            B_chain = B_all                           # (T, S_parent, S_parent)
             return update_site_chain(qs_chain, log_chain, B_chain)
 
-        def update_row(h_idx, qs1_curr, log_lik1_all, B_all):
+        def update_row(h, qs_parent_all, log_lik_all, B_all):
             return jax.vmap(
-                lambda w_idx: update_site(h_idx, w_idx, qs1_curr, log_lik1_all, B_all)
-            )(w_indices)  # (W1, T, S1)
+                lambda w: update_site(h, w, qs_parent_all, log_lik_all, B_all)
+            )(w_idx)  # (W_p_, T, S_parent)
 
-        qs1_rows = jax.vmap(
-            lambda h_idx: update_row(h_idx, qs1_grid_current, log_lik1, B_eff_all)
-        )(h_indices)  # (H1, W1, T, S1)
+        qs_parent_rows = jax.vmap(
+            lambda h: update_row(h, qs_parent_curr, log_lik_parent, B_parent_all)
+        )(h_idx)  # (H_p_, W_p_, T, S_parent)
 
-        qs1_grid_new = jnp.transpose(qs1_rows, (2, 0, 1, 3))  # (T, H1, W1, S1)
-        return qs1_grid_new
+        qs_parent_new = jnp.transpose(qs_parent_rows, (2, 0, 1, 3))  # (T, Hp, Wp, S_parent)
+        return qs_parent_new
 
-    # ----- Level-0 update -----
+    def update_child(qs_child_curr, qs_parent_curr):
+        H_p_, W_p_ = qs_parent_curr.shape[1], qs_parent_curr.shape[2]
+        H_c_, W_c_ = qs_child_curr.shape[1], qs_child_curr.shape[2]
+        assert H_c_ == 2 * H_p_ and W_c_ == 2 * W_p_
 
-    def update_level0(
-        qs0_grid_current: jnp.ndarray,
-        qs1_grid_current: jnp.ndarray,
-    ) -> jnp.ndarray:
-        H1_, W1_ = qs1_grid_current.shape[1], qs1_grid_current.shape[2]
+        log_prior_bias_child = top_down_prior_parent_to_child(
+            qs_parent_curr, D_parent, H_c_, W_c_, S_child
+        )  # (T, Hc, Wc, S_child)
 
-        def build_topdown_prior() -> jnp.ndarray:
-            def bias_for_time(t):
-                qs1_t = qs1_grid_current[t]  # (H1, W1, S1)
-                bias = jnp.zeros((H0, W0, S0), dtype=jnp.float32)
-
-                for h1 in range(H1_):
-                    for w1 in range(W1_):
-                        qs1_hw = qs1_t[h1, w1]  # (S1,)
-                        for child_idx, (dh, dw) in enumerate(
-                            [(0, 0), (0, 1), (1, 0), (1, 1)]
-                        ):
-                            h0 = 2 * h1 + dh
-                            w0 = 2 * w1 + dw
-                            child_states = D1[:, child_idx]  # (S1,)
-                            accum = jnp.zeros((S0,), dtype=jnp.float32)
-
-                            def body_fun(s1, acc):
-                                s0_pref = child_states[s1]
-                                return acc.at[s0_pref].add(qs1_hw[s1])
-
-                            accum = jax.lax.fori_loop(0, S1, body_fun, accum)
-                            accum = accum / (accum.sum() + 1e-8)
-                            log_accum = jnp.log(jnp.clip(accum, 1e-16))
-                            bias = bias.at[h0, w0, :].set(log_accum)
-                return bias
-
-            return jax.vmap(bias_for_time)(jnp.arange(T))  # (T, H0, W0, S0)
-
-        log_prior_bias0 = build_topdown_prior()
-
-        # Identity temporal kernel at level 0
-        B0 = jnp.eye(S0, dtype=jnp.float32)
+        # Identity kernel at child in this block
+        B_child = jnp.eye(S_child, dtype=jnp.float32)
 
         def update_site_chain(
-            qs0_chain: jnp.ndarray,
+            qs_child_chain: jnp.ndarray,
             log_bias_chain: jnp.ndarray,
         ) -> jnp.ndarray:
             """
-            qs0_chain: (T, S0)
-            log_bias_chain: (T, S0)
+            qs_child_chain: (T, S_child)
+            log_bias_chain: (T, S_child)
             """
 
             def forward_messages(qs_):
                 msgs = []
                 prev_q = qs_[0]
-                msgs.append(jnp.log(jnp.clip(E0, 1e-16)))
+                msgs.append(jnp.log(jnp.clip(E_child, 1e-16)))
                 for t in range(1, T):
-                    msg = jnp.log(jnp.clip(B0 @ prev_q, 1e-16))
+                    msg = jnp.log(jnp.clip(B_child @ prev_q, 1e-16))
                     msgs.append(msg)
                     prev_q = qs_[t]
                 return jnp.stack(msgs, axis=0)
@@ -491,7 +505,7 @@ def vmp_two_level_states(
                 next_q = qs_[-1]
                 msgs.append(jnp.zeros_like(next_q))
                 for t in range(T - 2, -1, -1):
-                    msg = jnp.log(jnp.clip(B0.T @ next_q, 1e-16))
+                    msg = jnp.log(jnp.clip(B_child.T @ next_q, 1e-16))
                     msgs.append(msg)
                     next_q = qs_[t]
                 msgs = msgs[::-1]
@@ -506,7 +520,7 @@ def vmp_two_level_states(
             def body_fun(_, qs_):
                 return vmp_iter(qs_)
 
-            qs_init = qs0_chain
+            qs_init = qs_child_chain
             qs_final = jax.lax.fori_loop(0, 1, body_fun, qs_init)
             return qs_final
 
@@ -516,27 +530,26 @@ def vmp_two_level_states(
             out_axes=1,
         )
 
-        qs0_grid_new = update_site_chain_vmap(qs0_grid_current, log_prior_bias0)
-        return qs0_grid_new
+        qs_child_new = update_site_chain_vmap(qs_child_curr, log_prior_bias_child)
+        return qs_child_new
 
-    # Alternating updates
-    qs0_current = qs0_grid
-    qs1_current = qs1_grid
+    qs_child_current = qs_child_grid
+    qs_parent_current = qs_parent_grid
 
     def alt_step(_, carry):
-        qs0_c, qs1_c = carry
-        qs1_new = update_level1(qs0_c, qs1_c, qu_top_eff if B_states_paths is not None else None)
-        qs0_new = update_level0(qs0_c, qs1_new)
-        return (qs0_new, qs1_new)
+        qs_child_c, qs_parent_c = carry
+        qs_parent_new = update_parent(qs_child_c, qs_parent_c)
+        qs_child_new = update_child(qs_child_c, qs_parent_new)
+        return (qs_child_new, qs_parent_new)
 
-    qs0_final, qs1_final = jax.lax.fori_loop(
-        0, num_iter, alt_step, (qs0_current, qs1_current)
+    qs_child_final, qs_parent_final = jax.lax.fori_loop(
+        0, num_iter, alt_step, (qs_child_current, qs_parent_current)
     )
 
-    return qs0_final, qs1_final
+    return qs_child_final, qs_parent_final
 
 # -----------------------------------------------------------------------------
-# 5. High-level inference entry point with EFE-based paths
+# 6. High-level inference entry point with multi-level states and EFE-based paths
 # -----------------------------------------------------------------------------
 
 def infer_lorenz_hierarchy(
@@ -551,11 +564,12 @@ def infer_lorenz_hierarchy(
     """
     Run variational inference over states and (optional) paths in the Lorenz hierarchy.
 
-    If the top level has a proper path factor (num_paths > 1 and C_paths/E_paths
-    are not None), we run EFE-based path inference; otherwise we only infer states.
+    If the highest level that carries a path factor (num_paths > 1 and C_paths/E_paths
+    are not None) exists, we run EFE-based path inference at that level, using
+    its own state posterior as qs_top_grid in compute_expected_free_energy_paths.
 
     Preferences C are derived from params.pref_alpha when params is provided.
-    Otherwise, a data-based heuristic is used via pref_mode.
+    Otherwise, an empirical fallback is used.
     """
     T0 = hierarchy.T0
     H0 = hierarchy.H_blocks
@@ -565,18 +579,16 @@ def infer_lorenz_hierarchy(
     A0 = level0.A
     O = A0.shape[1]
 
-    # Build observations
     obs_flat = build_lowest_level_observations_flat(lorenz_data_dict)  # (N, O)
     N = obs_flat.shape[0]
     assert N == T0 * H0 * W0, "Observation length mismatch."
 
-    # Preferences: from params.pref_alpha if available, else heuristic
+    # Preferences: from params.pref_alpha if available, else empirical fallback
     if params is not None:
         K = int(lorenz_data_dict["K"])
         L = int(lorenz_data_dict["L"])
         C = prefs_from_params(params, K, L)
     else:
-        # Fallback: empirical preferences from data (same as before)
         C = obs_flat.mean(axis=0)
         C = C / (C.sum() + 1e-8)
 
@@ -588,75 +600,137 @@ def infer_lorenz_hierarchy(
     qs_levels: List[Optional[jnp.ndarray]] = [qs0_grid]
     qu_levels: List[Optional[jnp.ndarray]] = [None]
 
-    qs1_grid = None
-    qu_top = None
+    # Early exit if only one level
+    if len(hierarchy.levels) == 1:
+        return {"qs_levels": qs_levels, "qu_levels": qu_levels}
 
-    # For now we only implement a 2-level state hierarchy with paths at level 1.
-    if len(hierarchy.levels) > 1:
-        level1: LorenzLevel = hierarchy.levels[1]
-        states_grid1 = hierarchy.states_grids[1]
+    # 2. Level-1 and (optionally) level-2 states
 
-        top_idx = len(hierarchy.levels) - 1
-        level_top = hierarchy.levels[top_idx]
+    # Level 1
+    level1: LorenzLevel = hierarchy.levels[1]
+    states_grid1 = hierarchy.states_grids[1]
 
-        # Paths are "active" if we have a full path factor:
-        # more than one path and both C_paths and E_paths defined.
-        paths_active = (
-            level_top.num_paths is not None
-            and level_top.num_paths > 1
-            and level_top.C_paths is not None
-            and level_top.E_paths is not None
-        )
+    # Initialize q(s^1)
+    T1, H1, W1 = states_grid1.shape
+    assert T1 == T0
+    qs1_grid = jnp.full(
+        (T0, H1, W1, level1.S),
+        1.0 / level1.S,
+        dtype=jnp.float32,
+    )
 
-        if paths_active:
-            U = level_top.num_paths
-            qu_top = jnp.full((T0, U), 1.0 / U, dtype=jnp.float32)
-        else:
-            qu_top = None
-
-        qs0_current = qs0_grid
-        qs1_current = jnp.full(
-            (T0, states_grid1.shape[1], states_grid1.shape[2], level1.S),
-            1.0 / level1.S,
+    # Level 2 if present
+    has_level2 = len(hierarchy.levels) > 2
+    if has_level2:
+        level2: LorenzLevel = hierarchy.levels[2]
+        states_grid2 = hierarchy.states_grids[2]
+        T2, H2, W2 = states_grid2.shape
+        assert T2 == T0
+        qs2_grid = jnp.full(
+            (T0, H2, W2, level2.S),
+            1.0 / level2.S,
             dtype=jnp.float32,
         )
+    else:
+        level2 = None
+        qs2_grid = None
 
-        for _ in range(num_iter_hier):
-            qs0_current, qs1_current = vmp_two_level_states(
-                level0,
-                level1,
-                qs0_current,
-                states_grid1,
-                qu_top=qu_top,
+    # Determine top level carrying paths
+    top_idx = None
+    for idx in reversed(range(len(hierarchy.levels))):
+        lvl = hierarchy.levels[idx]
+        if (
+            lvl.num_paths is not None
+            and lvl.num_paths > 1
+            and lvl.C_paths is not None
+            and lvl.E_paths is not None
+        ):
+            top_idx = idx
+            break
+
+    paths_active = top_idx is not None
+    if paths_active:
+        level_top = hierarchy.levels[top_idx]
+        U = level_top.num_paths
+        qu_top = jnp.full((T0, U), 1.0 / U, dtype=jnp.float32)
+    else:
+        level_top = None
+        qu_top = None
+
+    # Hierarchical inference:
+    # We alternate block updates:
+    #   0 <-> 1  (without paths)
+    #   1 <-> 2  (with paths if level 2 is top)
+
+    qs0_current = qs0_grid
+    qs1_current = qs1_grid
+    qs2_current = qs2_grid
+    qu_top_current = qu_top
+
+    for _ in range(num_iter_hier):
+        # 0 <-> 1 (no explicit paths at level 1 in this configuration)
+        qs0_current, qs1_current = vmp_two_level_states(
+            level_child=level0,
+            level_parent=level1,
+            qs_child_grid=qs0_current,
+            states_grid_parent=states_grid1,
+            qu_parent=None,
+            num_iter=1,
+        )
+
+        # 1 <-> 2 if level 2 exists
+        if has_level2:
+            # paths at level 2 if top_idx == 2
+            qu_for_level2 = qu_top_current if (paths_active and top_idx == 2) else None
+            qs1_current, qs2_current = vmp_two_level_states(
+                level_child=level1,
+                level_parent=level2,
+                qs_child_grid=qs1_current,
+                states_grid_parent=states_grid2,
+                qu_parent=qu_for_level2,
                 num_iter=1,
             )
 
-            if paths_active:
-                G_tu = compute_expected_free_energy_paths(
-                    level_top,
-                    level0,
-                    qs1_current,
-                    qs0_current,
-                    C,
-                    tau=2,  # planning horizon
-                )
+        # Path update if active
+        if paths_active:
+            # top-level state grid for EFE is from the level that carries paths
+            if top_idx == 2:
+                qs_top_grid = qs2_current
+            elif top_idx == 1:
+                qs_top_grid = qs1_current
+            else:
+                qs_top_grid = qs0_current  # (not expected in current config)
 
-                qu_top = update_path_posterior_from_G(
-                    level_top,
-                    G_tu,
-                    gamma=efe_gamma,
-                    num_iter=2,
-                )
+            level0_for_efe = level0
+            G_tu = compute_expected_free_energy_paths(
+                level_top=level_top,
+                level0=level0_for_efe,
+                qs_top_grid=qs_top_grid,
+                qs0_grid=qs0_current,
+                C=C,
+                tau=2,
+            )
+            qu_top_current = update_path_posterior_from_G(
+                level_top,
+                G_tu,
+                gamma=efe_gamma,
+                num_iter=2,
+            )
 
-        qs0_grid_h = qs0_current
-        qs1_grid = qs1_current
+    # Collect results
+    qs_levels[0] = qs0_current
+    qs_levels.append(qs1_current)
+    if has_level2:
+        qs_levels.append(qs2_current)
 
-        qs_levels[0] = qs0_grid_h
-        qs_levels.append(qs1_grid)
-        qu_levels.append(qu_top)
+    if paths_active:
+        qu_levels.append(qu_top_current)
     else:
-        if len(qu_levels) < len(hierarchy.levels):
-            qu_levels += [None] * (len(hierarchy.levels) - len(qu_levels))
+        qu_levels.append(None)
+
+    # Pad qu_levels to match number of levels (one qu entry per level)
+    while len(qu_levels) < len(hierarchy.levels):
+        qu_levels.append(None)
 
     return {
         "qs_levels": qs_levels,
