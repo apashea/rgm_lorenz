@@ -5,8 +5,8 @@ Variational message passing for the Lorenz hierarchy.
 This module provides:
 - Single-chain VMP for the lowest (patch) level using A, a simple temporal
   kernel, and E_states.
-- Patch-wise lowest-level inference by looping over patches and calling
-  the single-chain VMP (to keep memory usage manageable).
+- Patch-wise lowest-level inference by vectorizing over patches and calling
+  the single-chain VMP (to keep memory usage manageable and extensible).
 - Multi-level state inference with spatial renormalization:
   * bottom-up messages from level 0 to higher levels via D_state_from_parent
   * top-down messages from parent to child via D_state_from_parent
@@ -18,8 +18,8 @@ This is a Lorenz-specific instance of RGM-style inference and is structured
 to realize the RGM-style pixels-to-planning architecture.
 
 The implementation here is optimized by:
-- Vectorizing higher-level VMP over spatial sites using vmap (no Python
-  loops over (h,w) at parent/child levels).
+- Vectorizing lowest-level and higher-level VMP over spatial sites using vmap
+  (no Python loops over (h,w) at parent/child levels).
 
 We do NOT jit the full hierarchical inference entry point here, because
 hierarchy and params are Python objects (not pure JAX arrays). That can
@@ -49,6 +49,16 @@ DEBUG_INFERENCE = False
 def build_lowest_level_observations_flat(
     lorenz_data_dict: Dict[str, Any],
 ) -> jnp.ndarray:
+    """
+    Build a flat observation array suitable for lowest-level inference.
+
+    We treat the quantized coefficients as "observations" in a one-hot form
+    that is consistent with the A built in lorenz_model.py.
+
+    Returns:
+      obs_flat: (N, O) array, where N = T * H_blocks * W_blocks,
+                O = K * L.
+    """
     q_coeffs = lorenz_data_dict["q_coeffs"]  # (N, K)
     K = int(lorenz_data_dict["K"])
     L = int(lorenz_data_dict["L"])
@@ -75,6 +85,10 @@ def build_lowest_level_observations_flat(
 def build_lowest_level_observations_grid(
     lorenz_data_dict: Dict[str, Any],
 ) -> jnp.ndarray:
+    """
+    Build an observation array reshaped as (T, H0, W0, O) for patch-wise
+    inference.
+    """
     obs_flat = build_lowest_level_observations_flat(lorenz_data_dict)  # (N, O)
     T0 = int(lorenz_data_dict["T"])
     H0 = int(lorenz_data_dict["H_blocks"])
@@ -87,6 +101,17 @@ def prefs_from_params(
     K: int,
     L: int,
 ) -> jnp.ndarray:
+    """
+    Derive a categorical preference distribution C over lowest-level
+    outcomes from pref_alpha stored in LorenzRGMParams.
+
+    Args:
+      params: LorenzRGMParams with pref_alpha
+      K, L: lowest-level configuration (O0 = K * L)
+
+    Returns:
+      C: (O0,) normalized preference distribution
+    """
     O0 = K * L
     C = params.pref_alpha / (params.pref_alpha.sum() + 1e-8)
     assert C.shape[0] == O0, "prefs_from_params: pref_alpha shape mismatch with K*L."
@@ -103,6 +128,18 @@ def vmp_single_chain(
     obs: jnp.ndarray,
     num_iter: int = 8,
 ) -> jnp.ndarray:
+    """
+    Variational message passing for a single chain of hidden states.
+
+    Args:
+      A: (S, O)
+      B: (S, S)
+      E: (S,)
+      obs: (T, O)
+
+    Returns:
+      qs: (T, S)
+    """
     T = obs.shape[0]
     S = A.shape[0]
 
@@ -149,34 +186,72 @@ def vmp_single_chain(
     return qs
 
 # -----------------------------------------------------------------------------
-# 3. Patch-wise lowest-level inference (unchanged)
+# 3. Vectorized lowest-level inference over patches
 # -----------------------------------------------------------------------------
+
+def vmp_lowest_level_sites(
+    A0: jnp.ndarray,
+    E0: jnp.ndarray,
+    obs_flat: jnp.ndarray,
+    num_iter: int,
+) -> jnp.ndarray:
+    """
+    Vectorized VMP over all lowest-level sites (patches).
+
+    Args:
+      A0: (S0, O)
+      E0: (S0,)
+      obs_flat: (T0, N0, O) observations for all patches
+      num_iter: iterations at lowest level
+
+    Returns:
+      qs_flat: (T0, N0, S0)
+    """
+    S0 = A0.shape[0]
+    B0 = jnp.eye(S0, dtype=jnp.float32)
+
+    def vmp_site(obs_chain: jnp.ndarray) -> jnp.ndarray:
+        # obs_chain: (T0, O)
+        return vmp_single_chain(A0, B0, E0, obs_chain, num_iter=num_iter)  # (T0, S0)
+
+    # Vectorize over site dimension (axis=1)
+    qs_sites = jax.vmap(vmp_site, in_axes=1, out_axes=1)(obs_flat)  # (T0, N0, S0)
+    return qs_sites
+
 
 def infer_lowest_level_patches(
     level0: LorenzLevel,
     lorenz_data_dict: Dict[str, Any],
     num_iter_lowest: int = 8,
 ) -> jnp.ndarray:
+    """
+    Run VMP at the lowest level independently for each patch, vectorized
+    over patches (sites).
+
+    For now, we approximate temporal dynamics at level 0 with an identity
+    kernel (persistence), since all path-dependent dynamics are attached
+    to higher levels.
+
+    Returns:
+      qs0_grid: (T0, H0, W0, S0)
+    """
     A0 = level0.A
     E0 = level0.E_states
 
     obs_grid = build_lowest_level_observations_grid(lorenz_data_dict)  # (T0, H0, W0, O)
-    T0, H0, W0, _ = obs_grid.shape
+    T0, H0, W0, O = obs_grid.shape
     S0 = A0.shape[0]
+    N0 = H0 * W0
 
-    B0 = jnp.eye(S0, dtype=jnp.float32)
+    # Flatten spatial dimensions to a site axis
+    obs_flat = obs_grid.reshape(T0, N0, O)  # (T0, N0, O)
 
-    vmp_single_chain_jit = jax.jit(vmp_single_chain, static_argnames=("num_iter",))
+    qs_flat = vmp_lowest_level_sites(
+        A0, E0, obs_flat, num_iter=num_iter_lowest
+    )  # (T0, N0, S0)
 
-    qs0_host = np.zeros((T0, H0, W0, S0), dtype=np.float32)
-
-    for h0 in range(H0):
-        for w0 in range(W0):
-            obs_patch = obs_grid[:, h0, w0, :]
-            qs_chain = vmp_single_chain_jit(A0, B0, E0, obs_patch, num_iter=num_iter_lowest)
-            qs0_host[:, h0, w0, :] = np.array(qs_chain)
-
-    return jnp.array(qs0_host)
+    qs0_grid = qs_flat.reshape(T0, H0, W0, S0)
+    return qs0_grid
 
 # -----------------------------------------------------------------------------
 # 4. Bottom-up and top-down messages via D_state_from_parent
@@ -187,6 +262,17 @@ def bottom_up_message_child_to_parent(
     D_parent: jnp.ndarray,
     states_grid_parent: jnp.ndarray,
 ) -> jnp.ndarray:
+    """
+    Bottom-up pseudo-likelihood from a child level to a parent level via D.
+
+    Args:
+      qs_child_grid: (T, H_child, W_child, S_child)
+      D_parent: (S_parent, 4) integer child-state indices per parent state
+      states_grid_parent: (T, H_parent, W_parent)
+
+    Returns:
+      log_lik_parent: (T, H_parent, W_parent, S_parent)
+    """
     T, Hc, Wc, S_child = qs_child_grid.shape
     T1, Hp, Wp = states_grid_parent.shape
     assert T == T1
@@ -230,6 +316,18 @@ def top_down_prior_parent_to_child(
     W_child: int,
     S_child: int,
 ) -> jnp.ndarray:
+    """
+    Build a top-down log prior bias over child states from parent posteriors
+    using D_state_from_parent.
+
+    Args:
+      qs_parent_grid: (T, Hp, Wp, S_parent)
+      D_parent: (S_parent, 4) mapping parent->child states
+      H_child, W_child, S_child: child grid sizes
+
+    Returns:
+      log_prior_bias_child: (T, H_child, W_child, S_child)
+    """
     T, Hp, Wp, S_parent = qs_parent_grid.shape
     assert H_child == 2 * Hp and W_child == 2 * Wp
 
@@ -272,6 +370,18 @@ def _vmp_parent_chain(
     B_chain: jnp.ndarray,
     num_iter: int,
 ) -> jnp.ndarray:
+    """
+    VMP for a single parent site chain given time-varying temporal kernel.
+
+    Args:
+      log_lik_chain: (T, S_parent)
+      E_parent: (S_parent,)
+      B_chain: (T, S_parent, S_parent)
+      num_iter: number of iterations
+
+    Returns:
+      qs_parent_chain: (T, S_parent)
+    """
     T, S_parent = log_lik_chain.shape
 
     def forward_messages(qs_):
@@ -317,6 +427,18 @@ def _vmp_child_chain(
     B_child: jnp.ndarray,
     num_iter: int,
 ) -> jnp.ndarray:
+    """
+    VMP for a single child site chain with identity kernel (or fixed B_child).
+
+    Args:
+      log_bias_chain: (T, S_child)
+      E_child: (S_child,)
+      B_child: (S_child, S_child)
+      num_iter: iterations
+
+    Returns:
+      qs_child_chain: (T, S_child)
+    """
     T, S_child = log_bias_chain.shape
 
     def forward_messages(qs_):
@@ -362,6 +484,14 @@ def vmp_two_level_states(
     qu_parent: Optional[jnp.ndarray] = None,
     num_iter: int = 2,
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """
+    Coupled VMP over child and parent states with optional path-dependent
+    dynamics at the parent level.
+
+    This version is vectorized over spatial sites using vmap: each parent
+    (and corresponding child group) is treated as an independent chain, but
+    the update equations are identical to the original per-site code.
+    """
     E_child = level_child.E_states
     S_child = E_child.shape[0]
 
@@ -456,6 +586,9 @@ def _infer_lorenz_hierarchy_inner(
     efe_gamma: float,
     pref_mode: str,
 ) -> Dict[str, Any]:
+    """
+    Core inference logic (non-jitted) for the Lorenz hierarchy.
+    """
     T0 = hierarchy.T0
     H0 = hierarchy.H_blocks
     W0 = hierarchy.W_blocks
@@ -584,6 +717,7 @@ def _infer_lorenz_hierarchy_inner(
         "qs_levels": qs_levels,
         "qu_levels": qu_levels,
     }
+
 
 def infer_lorenz_hierarchy(
     hierarchy: LorenzHierarchy,
