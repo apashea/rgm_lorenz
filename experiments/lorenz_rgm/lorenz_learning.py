@@ -7,6 +7,7 @@ This module implements:
   posterior beliefs over states and observations.
 - Updates of Dirichlet concentration parameters stored in LorenzRGMParams:
     * A_alpha[l], E_states_alpha[l], pref_alpha
+    * D_state_from_parent_alpha[l] (if desired),
     * (optionally) B_states_paths_alpha[l], C_paths_alpha[l], E_paths_alpha[l]
 - A training loop scaffold that alternates between inference and parameter
   updates over one or more Lorenz trajectories.
@@ -52,17 +53,17 @@ def accumulate_A_counts_level0(
     Accumulate expected counts for A0 (lowest-level emission matrix).
 
     Args:
-      qs0_grid: (T, H0, W0, S0)
-      obs_grid: (T, H0, W0, O0)
+      qs0_grid: (T0, H0, W0, S0)
+      obs_grid: (T0, H0, W0, O0)
 
     Returns:
       dA0: (S0, O0)
     """
-    T, H0, W0, S0 = qs0_grid.shape
+    T0, H0, W0, S0 = qs0_grid.shape
     _, _, _, O0 = obs_grid.shape
 
-    qs_flat = qs0_grid.reshape(T * H0 * W0, S0)
-    obs_flat = obs_grid.reshape(T * H0 * W0, O0)
+    qs_flat = qs0_grid.reshape(T0 * H0 * W0, S0)
+    obs_flat = obs_grid.reshape(T0 * H0 * W0, O0)
 
     dA0 = qs_flat.T @ obs_flat
     return dA0
@@ -75,7 +76,7 @@ def accumulate_E_states_counts_level0(
     Accumulate expected counts for E_states^0 (prior over initial states).
 
     Args:
-      qs0_grid: (T, H0, W0, S0)
+      qs0_grid: (T0, H0, W0, S0)
 
     Returns:
       dE0: (S0,)
@@ -91,10 +92,10 @@ def accumulate_pref_counts(
     obs_grid: jnp.ndarray,
 ) -> jnp.ndarray:
     """
-    Accumulate counts for lowest-level preferences C0(o) from observations.
+    Accumulate counts for lowest-level preferences C(o) from observations.
 
     Args:
-      obs_grid: (T, H0, W0, O0)
+      obs_grid: (T0, H0, W0, O0)
 
     Returns:
       dC0: (O0,)
@@ -156,12 +157,10 @@ def accumulate_B_states_paths_counts_level(
 
     dB_states_paths = jnp.zeros((S, S, U), dtype=jnp.float32)
 
-    # Loop in Python over time and paths; JAX arrays are updated with .at[]
     for t in range(T - 1):
         qs_t = qs_flat[t]        # (N_sites, S)
         qs_tp1 = qs_flat[t + 1]  # (N_sites, S)
 
-        # base_t[s, s'] = sum_{h,w} q(s_t = s) q(s_{t+1} = s')
         base_t = qs_t.T @ qs_tp1  # (S, S)
 
         qu_t = qu[t]  # (U,)
@@ -224,7 +223,7 @@ def update_dirichlet_from_sequence(
     # 1. Observations as grid
     obs_grid = build_lowest_level_observations_grid(lorenz_data_dict)  # (T0, H0, W0, O0)
 
-    # 2. Inference (now passing params so preferences come from pref_alpha)
+    # 2. Inference (preferences from pref_alpha via params)
     results = infer_lorenz_hierarchy(
         hierarchy,
         lorenz_data_dict,
@@ -240,6 +239,7 @@ def update_dirichlet_from_sequence(
 
     qs0_grid = qs_levels[0]
     qs1_grid = qs_levels[1] if len(qs_levels) > 1 else None
+    qs2_grid = qs_levels[2] if len(qs_levels) > 2 else None
     qu_top = qu_levels[-1] if len(qu_levels) > 1 else None
 
     # 3. Level 0 counts
@@ -256,26 +256,46 @@ def update_dirichlet_from_sequence(
         dE1 = accumulate_E_states_counts_level(qs1_grid)
         params.E_states_alpha[1] = params.E_states_alpha[1] + dE1
 
-    # 5. Path counts at top level (assuming top level carries paths)
+    if qs2_grid is not None and len(params.E_states_alpha) > 2:
+        dE2 = accumulate_E_states_counts_level(qs2_grid)
+        params.E_states_alpha[2] = params.E_states_alpha[2] + dE2
+
+    # 5. Path counts at the highest path-carrying level (top_idx)
     if qu_top is not None:
-        top_idx = len(params.C_paths_alpha) - 1
-        if (
-            params.C_paths_alpha[top_idx] is not None
-            and params.E_paths_alpha[top_idx] is not None
-        ):
+        # Find highest level with path factor, consistent with inference
+        top_idx = None
+        for idx in reversed(range(len(params.C_paths_alpha))):
+            if (
+                params.C_paths_alpha[idx] is not None
+                and params.E_paths_alpha[idx] is not None
+            ):
+                top_idx = idx
+                break
+
+        if top_idx is not None:
             dC_paths, dE_paths = accumulate_C_E_paths(qu_top)
             params.C_paths_alpha[top_idx] = params.C_paths_alpha[top_idx] + dC_paths
             params.E_paths_alpha[top_idx] = params.E_paths_alpha[top_idx] + dE_paths
 
-    # 6. Path-dependent state transitions at top (or any) level
-    #    Here we assume qs1_grid is the state grid for the level that has paths.
-    if (
-        qs1_grid is not None
-        and qu_top is not None
-        and params.B_states_paths_alpha[-1] is not None
-    ):
-        dB_states_paths = accumulate_B_states_paths_counts_level(qs1_grid, qu_top)
-        params.B_states_paths_alpha[-1] = params.B_states_paths_alpha[-1] + dB_states_paths
+            # 6. Path-dependent state transitions at that same level
+            if (
+                params.B_states_paths_alpha[top_idx] is not None
+            ):
+                qs_top_grid = None
+                if top_idx == 2 and qs2_grid is not None:
+                    qs_top_grid = qs2_grid
+                elif top_idx == 1 and qs1_grid is not None:
+                    qs_top_grid = qs1_grid
+                elif top_idx == 0:
+                    qs_top_grid = qs0_grid
+
+                if qs_top_grid is not None:
+                    dB_states_paths = accumulate_B_states_paths_counts_level(
+                        qs_top_grid, qu_top
+                    )
+                    params.B_states_paths_alpha[top_idx] = (
+                        params.B_states_paths_alpha[top_idx] + dB_states_paths
+                    )
 
     return params
 
@@ -316,7 +336,7 @@ def train_lorenz_rgm(
       num_epochs: number of epochs
       num_sequences_per_epoch: sequences per epoch
       num_iter_lowest: iterations at lowest level
-      num_iter_hier: iterations at higher level
+      num_iter_hier: iterations at higher levels
       efe_gamma: precision over EFE
       pref_mode: preference mode
 
