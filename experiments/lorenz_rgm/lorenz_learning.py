@@ -348,7 +348,7 @@ def train_lorenz_rgm(
     for epoch in range(num_epochs):
         #print(f"train_lorenz_rgm(): Epoch {epoch+1}/{num_epochs}")
         for seq_i in range(num_sequences_per_epoch):
-            print(f"train_lorenz_rgm(): Epoch {epoch+1}/{num_epochs} - Sequence {seq_i}/{num_sequences_per_epoch}")
+            print(f"train_lorenz_rgm(): Epoch {epoch+1}/{num_epochs} - Sequence {seq_i+1}/{num_sequences_per_epoch}")
             lorenz_data_dict = build_data_fn()
 
             hierarchy = build_lorenz_hierarchy_from_params(
