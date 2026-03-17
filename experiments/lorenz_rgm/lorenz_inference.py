@@ -25,7 +25,7 @@ import jax
 import jax.numpy as jnp
 from jax import nn
 
-from .lorenz_model import LorenzHierarchy, LorenzLevel
+from .lorenz_model import LorenzHierarchy, LorenzLevel, LorenzRGMParams
 from .lorenz_efe import (
     compute_expected_free_energy_paths,
     update_path_posterior_from_G,
@@ -88,21 +88,25 @@ def build_lowest_level_observations_grid(
     return obs_grid
 
 
-def build_preference_distribution_lowest(
-    O: int,
-    mode: str = "data_empirical",
-    obs_flat: Optional[jnp.ndarray] = None,
+def prefs_from_params(
+    params: LorenzRGMParams,
+    K: int,
+    L: int,
 ) -> jnp.ndarray:
     """
-    Build a preference distribution C over lowest-level outcomes (O-dim).
-    """
-    if mode == "uniform" or obs_flat is None:
-        C = jnp.ones((O,), dtype=jnp.float32)
-        C = C / C.sum()
-        return C
+    Derive a categorical preference distribution C over lowest-level
+    outcomes from pref_alpha stored in LorenzRGMParams.
 
-    C = obs_flat.mean(axis=0)
-    C = C / (C.sum() + 1e-8)
+    Args:
+      params: LorenzRGMParams with pref_alpha
+      K, L: lowest-level configuration (O0 = K * L)
+
+    Returns:
+      C: (O0,) normalized preference distribution
+    """
+    O0 = K * L
+    C = params.pref_alpha / (params.pref_alpha.sum() + 1e-8)
+    assert C.shape[0] == O0, "prefs_from_params: pref_alpha shape mismatch with K*L."
     return C
 
 # -----------------------------------------------------------------------------
@@ -317,7 +321,6 @@ def vmp_two_level_states(
     if B_states_paths is None:
         S1 = E1.shape[0]
         B1 = jnp.eye(S1, dtype=jnp.float32)
-        U = 0
         qu_top_eff = None
     else:
         S1 = B_states_paths.shape[0]
@@ -402,15 +405,14 @@ def vmp_two_level_states(
             return qs_final
 
         H1_, W1_ = qs1_grid_current.shape[1], qs1_grid_current.shape[2]
+        h_indices = jnp.arange(H1_)
+        w_indices = jnp.arange(W1_)
 
         def update_site(h_idx, w_idx, qs1_curr, log_lik1_all, B_all):
             qs_chain = qs1_curr[:, h_idx, w_idx, :]      # (T, S1)
             log_chain = log_lik1_all[:, h_idx, w_idx, :] # (T, S1)
             B_chain = B_all                              # (T, S1, S1)
             return update_site_chain(qs_chain, log_chain, B_chain)
-
-        h_indices = jnp.arange(H1_)
-        w_indices = jnp.arange(W1_)
 
         def update_row(h_idx, qs1_curr, log_lik1_all, B_all):
             return jax.vmap(
@@ -540,6 +542,7 @@ def vmp_two_level_states(
 def infer_lorenz_hierarchy(
     hierarchy: LorenzHierarchy,
     lorenz_data_dict: Dict[str, Any],
+    params: Optional[LorenzRGMParams] = None,
     num_iter_lowest: int = 8,
     num_iter_hier: int = 4,
     efe_gamma: float = 16.0,
@@ -550,6 +553,9 @@ def infer_lorenz_hierarchy(
 
     If the top level has a proper path factor (num_paths > 1 and C_paths/E_paths
     are not None), we run EFE-based path inference; otherwise we only infer states.
+
+    Preferences C are derived from params.pref_alpha when params is provided.
+    Otherwise, a data-based heuristic is used via pref_mode.
     """
     T0 = hierarchy.T0
     H0 = hierarchy.H_blocks
@@ -559,11 +565,20 @@ def infer_lorenz_hierarchy(
     A0 = level0.A
     O = A0.shape[1]
 
+    # Build observations
     obs_flat = build_lowest_level_observations_flat(lorenz_data_dict)  # (N, O)
     N = obs_flat.shape[0]
     assert N == T0 * H0 * W0, "Observation length mismatch."
 
-    C = build_preference_distribution_lowest(O, mode=pref_mode, obs_flat=obs_flat)
+    # Preferences: from params.pref_alpha if available, else heuristic
+    if params is not None:
+        K = int(lorenz_data_dict["K"])
+        L = int(lorenz_data_dict["L"])
+        C = prefs_from_params(params, K, L)
+    else:
+        # Fallback: empirical preferences from data (same as before)
+        C = obs_flat.mean(axis=0)
+        C = C / (C.sum() + 1e-8)
 
     # 1. Level-0 states
     qs0_grid = infer_lowest_level_patches(
