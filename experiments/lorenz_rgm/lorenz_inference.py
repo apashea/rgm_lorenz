@@ -32,6 +32,9 @@ from .lorenz_efe import (
     update_path_posterior_from_G,
 )
 
+# Global debug flag for this module
+DEBUG_INFERENCE = False
+
 # -----------------------------------------------------------------------------
 # 1. Utilities: observations and preferences for lowest level
 # -----------------------------------------------------------------------------
@@ -47,7 +50,7 @@ def build_lowest_level_observations_flat(
 
     Returns:
       obs_flat: (N, O) array, where N = T * H_blocks * W_blocks,
-        O = K * L.
+                O = K * L.
     """
     q_coeffs = lorenz_data_dict["q_coeffs"]  # (N, K)
     K = int(lorenz_data_dict["K"])
@@ -375,7 +378,9 @@ def vmp_two_level_states(
 
     # Effective temporal kernel at parent
     if B_states_paths_parent is None:
-        B_parent_all = jnp.broadcast_to(jnp.eye(S_parent, dtype=jnp.float32), (T, S_parent, S_parent))
+        B_parent_all = jnp.broadcast_to(
+            jnp.eye(S_parent, dtype=jnp.float32), (T, S_parent, S_parent)
+        )
     else:
         U = B_states_paths_parent.shape[2]
         if qu_parent is None:
@@ -390,7 +395,9 @@ def vmp_two_level_states(
         B_parent_all = jax.vmap(B_eff_for_time)(jnp.arange(T))  # (T, S_parent, S_parent)
 
     # Initialize parent states uniformly
-    qs_parent_grid = jnp.full((T, Hp, Wp, S_parent), 1.0 / S_parent, dtype=jnp.float32)
+    qs_parent_grid = jnp.full(
+        (T, Hp, Wp, S_parent), 1.0 / S_parent, dtype=jnp.float32
+    )
 
     # ----- Alternating updates -----
 
@@ -452,9 +459,9 @@ def vmp_two_level_states(
         w_idx = jnp.arange(W_p_)
 
         def update_site(h, w, qs_parent_all, log_lik_all, B_all):
-            qs_chain = qs_parent_all[:, h, w, :]      # (T, S_parent)
-            log_chain = log_lik_all[:, h, w, :]       # (T, S_parent)
-            B_chain = B_all                           # (T, S_parent, S_parent)
+            qs_chain = qs_parent_all[:, h, w, :]  # (T, S_parent)
+            log_chain = log_lik_all[:, h, w, :]  # (T, S_parent)
+            B_chain = B_all  # (T, S_parent, S_parent)
             return update_site_chain(qs_chain, log_chain, B_chain)
 
         def update_row(h, qs_parent_all, log_lik_all, B_all):
@@ -545,7 +552,6 @@ def vmp_two_level_states(
     qs_child_final, qs_parent_final = jax.lax.fori_loop(
         0, num_iter, alt_step, (qs_child_current, qs_parent_current)
     )
-
     return qs_child_final, qs_parent_final
 
 # -----------------------------------------------------------------------------
@@ -597,11 +603,14 @@ def infer_lorenz_hierarchy(
         level0, lorenz_data_dict, num_iter_lowest=num_iter_lowest
     )
 
-    qs_levels: List[Optional[jnp.ndarray]] = [qs0_grid]
-    qu_levels: List[Optional[jnp.ndarray]] = [None]
+    num_levels = len(hierarchy.levels)
+    qs_levels: List[Optional[jnp.ndarray]] = [None] * num_levels
+    qu_levels: List[Optional[jnp.ndarray]] = [None] * num_levels
+
+    qs_levels[0] = qs0_grid
 
     # Early exit if only one level
-    if len(hierarchy.levels) == 1:
+    if num_levels == 1:
         return {"qs_levels": qs_levels, "qu_levels": qu_levels}
 
     # 2. Level-1 and (optionally) level-2 states
@@ -620,7 +629,7 @@ def infer_lorenz_hierarchy(
     )
 
     # Level 2 if present
-    has_level2 = len(hierarchy.levels) > 2
+    has_level2 = num_levels > 2
     if has_level2:
         level2: LorenzLevel = hierarchy.levels[2]
         states_grid2 = hierarchy.states_grids[2]
@@ -633,11 +642,12 @@ def infer_lorenz_hierarchy(
         )
     else:
         level2 = None
+        states_grid2 = None
         qs2_grid = None
 
-    # Determine top level carrying paths
+    # Determine top level carrying paths (by level index)
     top_idx = None
-    for idx in reversed(range(len(hierarchy.levels))):
+    for idx in reversed(range(num_levels)):
         lvl = hierarchy.levels[idx]
         if (
             lvl.num_paths is not None
@@ -653,14 +663,15 @@ def infer_lorenz_hierarchy(
         level_top = hierarchy.levels[top_idx]
         U = level_top.num_paths
         qu_top = jnp.full((T0, U), 1.0 / U, dtype=jnp.float32)
+        if DEBUG_INFERENCE:
+            print(f"[infer_lorenz_hierarchy] top_idx={top_idx}, num_paths={U}")
     else:
         level_top = None
         qu_top = None
 
-    # Hierarchical inference:
-    # We alternate block updates:
-    #   0 <-> 1  (without paths)
-    #   1 <-> 2  (with paths if level 2 is top)
+    # Hierarchical inference: alternate block updates:
+    # 0 <-> 1 (without paths)
+    # 1 <-> 2 (with paths if level 2 is top)
 
     qs0_current = qs0_grid
     qs1_current = qs1_grid
@@ -702,6 +713,8 @@ def infer_lorenz_hierarchy(
                 qs_top_grid = qs0_current  # (not expected in current config)
 
             level0_for_efe = level0
+            # Note: in this implementation, G_tu is treated as time-constant
+            # (computed from the current posteriors and broadcast over t).
             G_tu = compute_expected_free_energy_paths(
                 level_top=level_top,
                 level0=level0_for_efe,
@@ -710,6 +723,7 @@ def infer_lorenz_hierarchy(
                 C=C,
                 tau=2,
             )
+
             qu_top_current = update_path_posterior_from_G(
                 level_top,
                 G_tu,
@@ -717,20 +731,20 @@ def infer_lorenz_hierarchy(
                 num_iter=2,
             )
 
-    # Collect results
+            if DEBUG_INFERENCE:
+                qu_mean = np.array(qu_top_current.mean(axis=0))
+                qu_std = np.array(qu_top_current.std(axis=0))
+                print(f"[infer_lorenz_hierarchy] qu_top mean={qu_mean}, std={qu_std}")
+
+    # Collect results per level
     qs_levels[0] = qs0_current
-    qs_levels.append(qs1_current)
-    if has_level2:
-        qs_levels.append(qs2_current)
+    if num_levels > 1:
+        qs_levels[1] = qs1_current
+    if num_levels > 2:
+        qs_levels[2] = qs2_current
 
-    if paths_active:
-        qu_levels.append(qu_top_current)
-    else:
-        qu_levels.append(None)
-
-    # Pad qu_levels to match number of levels (one qu entry per level)
-    while len(qu_levels) < len(hierarchy.levels):
-        qu_levels.append(None)
+    if paths_active and qu_top_current is not None:
+        qu_levels[top_idx] = qu_top_current
 
     return {
         "qs_levels": qs_levels,
