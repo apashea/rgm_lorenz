@@ -30,6 +30,7 @@ from .lorenz_efe import (
     update_path_posterior_from_G,
 )
 
+
 # -----------------------------------------------------------------------------
 # 1. Utilities: observations and preferences for lowest level
 # -----------------------------------------------------------------------------
@@ -44,8 +45,8 @@ def build_lowest_level_observations_flat(
     that is consistent with the A built in lorenz_model.py.
 
     Returns:
-        obs_flat: (N, O) array, where N = T * H_blocks * W_blocks,
-                  O = K * L.
+      obs_flat: (N, O) array, where N = T * H_blocks * W_blocks,
+                O = K * L.
     """
     q_coeffs = lorenz_data_dict["q_coeffs"]  # (N, K)
     K = int(lorenz_data_dict["K"])
@@ -120,13 +121,13 @@ def vmp_single_chain(
     Variational message passing for a single chain of hidden states.
 
     Args:
-        A: (S, O)
-        B: (S, S)
-        E: (S,)
-        obs: (T, O)
+      A: (S, O)
+      B: (S, S)
+      E: (S,)
+      obs: (T, O)
 
     Returns:
-        qs: (T, S)
+      qs: (T, S)
     """
     T = obs.shape[0]
     S = A.shape[0]
@@ -187,7 +188,7 @@ def infer_lowest_level_patches(
     Run VMP at the lowest level independently for each patch.
 
     Returns:
-        qs0_grid: (T, H0, W0, S0)
+      qs0_grid: (T, H0, W0, S0)
     """
     A0 = level0.A
     B0 = level0.B_states
@@ -224,12 +225,12 @@ def bottom_up_message_level0_to_level1(
     Bottom-up pseudo-likelihood from Level 0 to Level 1 via D.
 
     Args:
-        qs0_grid: (T, H0, W0, S0)
-        D1: (S1, 4)
-        states_grid1: (T, H1, W1)
+      qs0_grid: (T, H0, W0, S0)
+      D1: (S1, 4)
+      states_grid1: (T, H1, W1)
 
     Returns:
-        log_lik1: (T, H1, W1, S1)
+      log_lik1: (T, H1, W1, S1)
     """
     T, H0, W0, S0 = qs0_grid.shape
     T1, H1, W1 = states_grid1.shape
@@ -280,16 +281,16 @@ def vmp_two_level_states(
     Coupled VMP over Level-0 and Level-1 states with path-dependent B1 at top.
 
     Args:
-        level0: lowest-level LorenzLevel
-        level1: parent-level LorenzLevel
-        qs0_grid: (T, H0, W0, S0)
-        states_grid1: (T, H1, W1)
-        qu_top: (T, U) or None
-        num_iter: alternating sweeps
+      level0: lowest-level LorenzLevel
+      level1: parent-level LorenzLevel
+      qs0_grid: (T, H0, W0, S0)
+      states_grid1: (T, H1, W1)
+      qu_top: (T, U) or None
+      num_iter: alternating sweeps
 
     Returns:
-        qs0_final: (T, H0, W0, S0)
-        qs1_final: (T, H1, W1, S1)
+      qs0_final: (T, H0, W0, S0)
+      qs1_final: (T, H1, W1, S1)
     """
     A0 = level0.A
     B0 = level0.B_states
@@ -298,7 +299,7 @@ def vmp_two_level_states(
     B1 = level1.B_states
     E1 = level1.E_states
     D1 = level1.D
-    # Current model: B_states_paths has shape (S1, S1, U)
+    # B_states_paths has shape (S1, S1, U) if present
     B_states_paths = level1.B_states_paths  # (S1, S1, U) or None
 
     T, H0, W0, S0 = qs0_grid.shape
@@ -332,7 +333,7 @@ def vmp_two_level_states(
         )  # (T, H1, W1, S1)
 
         if B_states_paths is not None and qu_current is not None:
-            # B_states_paths: (S1, S1, U), qu_current: (T, U)
+
             def B_eff_for_time(t):
                 qu_t = qu_current[t]  # (U,)
                 return (B_states_paths * qu_t[None, None, :]).sum(axis=2)  # (S1, S1)
@@ -351,6 +352,7 @@ def vmp_two_level_states(
             log_lik_chain: (T, S1)
             B_eff_chain: (T, S1, S1)
             """
+
             def forward_messages(qs_):
                 msgs = []
                 prev_q = qs_[0]
@@ -392,9 +394,9 @@ def vmp_two_level_states(
         w_indices = jnp.arange(W1_)
 
         def update_site(h_idx, w_idx, qs1_curr, log_lik1_all, B_all):
-            qs_chain = qs1_curr[:, h_idx, w_idx, :]       # (T, S1)
+            qs_chain = qs1_curr[:, h_idx, w_idx, :]  # (T, S1)
             log_chain = log_lik1_all[:, h_idx, w_idx, :]  # (T, S1)
-            B_chain = B_all                              # (T, S1, S1)
+            B_chain = B_all  # (T, S1, S1)
             return update_site_chain(qs_chain, log_chain, B_chain)
 
         def update_row(h_idx, qs1_curr, log_lik1_all, B_all):
@@ -455,6 +457,7 @@ def vmp_two_level_states(
             qs0_chain: (T, S0)
             log_bias_chain: (T, S0)
             """
+
             def forward_messages(qs_):
                 msgs = []
                 prev_q = qs_[0]
@@ -511,6 +514,7 @@ def vmp_two_level_states(
     qs0_final, qs1_final = jax.lax.fori_loop(
         0, num_iter, alt_step, (qs0_current, qs1_current)
     )
+
     return qs0_final, qs1_final
 
 
@@ -557,6 +561,7 @@ def infer_lorenz_hierarchy(
     qs1_grid = None
     qu_top = None
 
+    # For now we only implement a 2-level state hierarchy with paths at level 1.
     if len(hierarchy.levels) > 1:
         level1: LorenzLevel = hierarchy.levels[1]
         states_grid1 = hierarchy.states_grids[1]
@@ -603,7 +608,9 @@ def infer_lorenz_hierarchy(
                     qs1_current,
                     qs0_current,
                     C,
+                    tau=2,  # planning horizon, kept fixed here
                 )
+
                 qu_top = update_path_posterior_from_G(
                     level_top,
                     G_tu,
