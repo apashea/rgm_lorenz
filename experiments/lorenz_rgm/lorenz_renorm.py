@@ -18,13 +18,16 @@ This module:
 
 All functions are written in a level-agnostic way so they can be used
 for 1, 2, or more RG steps without renaming or re-structuring code.
+
+NOTE:
+- The symbol T here denotes the lowest-level temporal horizon (T0) used
+  in LorenzHierarchy.
 """
 
 from typing import Dict, Any, Tuple, List, Optional
 
 import numpy as np
 import jax.numpy as jnp
-
 
 # -----------------------------------------------------------------------------
 # 1. Utilities: reshape between flat and grid states
@@ -40,13 +43,13 @@ def states_flat_to_grid(
     Reshape flat patch states into a 3D grid over time.
 
     Args:
-        states_flat: (T * H_blocks * W_blocks,) integer states
-        T: number of time steps
-        H_blocks: number of patch rows at level 0
-        W_blocks: number of patch columns at level 0
+      states_flat: (T * H_blocks * W_blocks,) integer states
+      T: number of time steps (T0 at lowest level)
+      H_blocks: number of patch rows at level 0
+      W_blocks: number of patch columns at level 0
 
     Returns:
-        states_grid: (T, H_blocks, W_blocks) integer states
+      states_grid: (T, H_blocks, W_blocks) integer states
     """
     return states_flat.reshape(T, H_blocks, W_blocks)
 
@@ -56,10 +59,10 @@ def states_grid_to_flat(states_grid: jnp.ndarray) -> jnp.ndarray:
     Flatten (T, H, W) states back to a 1D array.
 
     Args:
-        states_grid: (T, H, W)
+      states_grid: (T, H, W)
 
     Returns:
-        states_flat: (T * H * W,)
+      states_flat: (T * H * W,)
     """
     T, H, W = states_grid.shape
     return states_grid.reshape(T * H * W,)
@@ -77,12 +80,12 @@ def _build_parent_mapping_for_group_explicit(
     single group-site, scanning over time.
 
     Args:
-        child_patterns: (T, 4) integer child states for one group-site
-            across all time points.
+      child_patterns: (T, 4) integer child states for one group-site
+        across all time points.
 
     Returns:
-        parent_ids: (T,) array of local parent state indices (int64)
-        pattern_to_parent: dict mapping pattern tuples -> local index
+      parent_ids: (T,) array of local parent state indices (int64)
+      pattern_to_parent: dict mapping pattern tuples -> local index
     """
     T = child_patterns.shape[0]
     pattern_to_parent: Dict[Tuple[int, ...], int] = {}
@@ -116,16 +119,16 @@ def rg_step_level(states_grid: jnp.ndarray) -> Dict[str, Any]:
           * unique rows in D for each parent (one row per pattern).
 
     Args:
-        states_grid: (T, H, W) integer states at current level.
+      states_grid: (T, H, W) integer states at current level.
 
     Returns:
-        dict with:
-          'parent_states_grid': (T, H2, W2) integer parent states
-          'group_pattern_maps': list (length H2 * W2) of dicts
-              pattern_tuple (4,) -> parent_state_idx (global int)
-          'D': (num_parent_states_total, 4) child state patterns
-          'group_shape': (H2, W2)
-          'num_parent_states_total': total number of parent states
+      dict with:
+        'parent_states_grid': (T, H2, W2) integer parent states
+        'group_pattern_maps': list (length H2 * W2) of dicts
+            pattern_tuple (4,) -> parent_state_idx (global int)
+        'D': (num_parent_states_total, 4) child state patterns
+        'group_shape': (H2, W2)
+        'num_parent_states_total': total number of parent states
     """
     T, H, W = states_grid.shape
     assert H % 2 == 0 and W % 2 == 0, "H and W must be even for 2x2 grouping."
@@ -169,6 +172,7 @@ def rg_step_level(states_grid: jnp.ndarray) -> Dict[str, Any]:
                 [local_to_global[int(loc_idx)] for loc_idx in parent_ids_local],
                 dtype=np.int32,
             )
+
             parent_states_grid_np[:, h2, w2] = parent_ids_global
 
             # Store mapping for this group-site (global indices)
@@ -207,29 +211,29 @@ def build_spatial_hierarchy(
     lowest-level patch states.
 
     Args:
-        states_flat: (T * H_blocks * W_blocks,) integer states at level 0
-        T: number of time steps
-        H_blocks: number of patch rows at level 0
-        W_blocks: number of patch columns at level 0
-        num_levels: number of RG steps to apply:
-            - num_levels = 0: only level 0 (patch level)
-            - num_levels = 1: levels 0 and 1 (one RG step)
-            - num_levels = 2: levels 0,1,2 (two RG steps), etc.
+      states_flat: (T * H_blocks * W_blocks,) integer states at level 0
+      T: number of time steps (T0)
+      H_blocks: number of patch rows at level 0
+      W_blocks: number of patch columns at level 0
+      num_levels: number of RG steps to apply:
+        - num_levels = 0: only level 0 (patch level)
+        - num_levels = 1: levels 0 and 1 (one RG step)
+        - num_levels = 2: levels 0,1,2 (two RG steps), etc.
 
     Returns:
-        dict with:
-          'levels': list of level dicts, l = 0..L
-              level[0]:
-                {'states_grid': (T,H0,W0),
-                 'group_shape': (H0,W0),
-                 'D': None,
-                 'group_pattern_maps': None}
-              level[l>0]:
-                {'states_grid': (T,H_l,W_l),
-                 'group_shape': (H_l,W_l),
-                 'D': (S_l,4),
-                 'group_pattern_maps': list of dicts}
-          'T': T
+      dict with:
+        'levels': list of level dicts, l = 0..L
+          level[0]:
+            {'states_grid': (T,H0,W0),
+             'group_shape': (H0,W0),
+             'D': None,
+             'group_pattern_maps': None}
+          level[l>0]:
+            {'states_grid': (T,H_l,W_l),
+             'group_shape': (H_l,W_l),
+             'D': (S_l,4),
+             'group_pattern_maps': list of dicts}
+        'T': T
     """
     assert num_levels >= 0, "num_levels must be >= 0."
 
@@ -267,6 +271,7 @@ def build_spatial_hierarchy(
             "D": rg_result["D"],
             "group_pattern_maps": rg_result["group_pattern_maps"],
         }
+
         levels.append(level_dict)
 
         current_states_grid = parent_states_grid
@@ -291,16 +296,16 @@ def build_lorenz_spatial_hierarchy(
     spatial RG hierarchy via repeated 2x2 steps.
 
     Args:
-        lorenz_data_dict: dict returned by build_lorenz_patch_dataset
-            (must contain 'states', 'T', 'H_blocks', 'W_blocks')
-        num_levels: number of RG steps above the patch level to build
+      lorenz_data_dict: dict returned by build_lorenz_patch_dataset
+        (must contain 'states', 'T', 'H_blocks', 'W_blocks')
+      num_levels: number of RG steps above the patch level to build
 
     Returns:
-        dict with:
-          'levels': list of level dicts (see build_spatial_hierarchy)
-          'T': T
-          plus copies of useful fields from lorenz_data_dict:
-            'H_blocks', 'W_blocks', 'K', 'L', 'patch_size', 'img_size'
+      dict with:
+        'levels': list of level dicts (see build_spatial_hierarchy)
+        'T': T (T0)
+      plus copies of useful fields from lorenz_data_dict:
+        'H_blocks', 'W_blocks', 'K', 'L', 'patch_size', 'img_size'
     """
     states_flat = lorenz_data_dict["states"]
     T = int(lorenz_data_dict["T"])
@@ -325,6 +330,7 @@ def build_lorenz_spatial_hierarchy(
         "patch_size": int(lorenz_data_dict["patch_size"]),
         "img_size": int(lorenz_data_dict["img_size"]),
     }
+
     return result
 
 
@@ -341,18 +347,18 @@ def check_spatial_hierarchy_consistency(
     """
     Verify that (at least) the first RG level is consistent:
 
-    - For randomly sampled times and group-sites at level 1,
-      the D row corresponding to the parent state matches exactly
-      the 4 child states at level 0.
+      - For randomly sampled times and group-sites at level 1,
+        the D row corresponding to the parent state matches exactly
+        the 4 child states at level 0.
 
     Args:
-        lorenz_data_dict: original data dict (for level-0 states)
-        spatial_hierarchy: output of build_lorenz_spatial_hierarchy
-        num_samples: number of (t, h1, w1) samples to check
-        rng: optional numpy RandomState for reproducibility
+      lorenz_data_dict: original data dict (for level-0 states)
+      spatial_hierarchy: output of build_lorenz_spatial_hierarchy
+      num_samples: number of (t, h1, w1) samples to check
+      rng: optional numpy RandomState for reproducibility
 
     Returns:
-        True if all sampled checks pass; raises AssertionError otherwise.
+      True if all sampled checks pass; raises AssertionError otherwise.
     """
     if rng is None:
         rng = np.random.RandomState(0)
