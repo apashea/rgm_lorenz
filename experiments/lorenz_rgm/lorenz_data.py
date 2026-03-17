@@ -17,10 +17,6 @@ IMPORTANT:
   This is a tractable approximation to the pixel-pattern based RG
   described in the RGM paper and may be revised in future for closer
   fidelity.
-
-NOTE:
-- The symbol T here corresponds to the lowest-level time horizon T0
-  used in LorenzHierarchy (T0 = number of fine-scale steps).
 """
 
 from typing import Dict, Any, Tuple
@@ -28,9 +24,6 @@ from typing import Dict, Any, Tuple
 import numpy as np
 import jax.numpy as jnp
 from scipy.integrate import solve_ivp
-
-# Global debug flag
-DEBUG_DATA = False
 
 # -----------------------------------------------------------------------------
 # 1. Lorenz simulation
@@ -49,12 +42,12 @@ def simulate_lorenz(
     """
     Simulate the Lorenz system for T steps with step size dt.
 
-      dx/dt = sigma * (y - x)
-      dy/dt = x * (rho - z) - y
-      dz/dt = x * y - beta * z
+    dx/dt = sigma * (y - x)
+    dy/dt = x * (rho - z) - y
+    dz/dt = x * y - beta * z
 
     Args:
-      T: number of time steps (this is T0 at the lowest RGM level)
+      T: number of time steps
       dt: step size
       sigma, rho, beta: Lorenz parameters
       x0, y0, z0: initial conditions
@@ -71,14 +64,7 @@ def simulate_lorenz(
 
     t_span = (0.0, (T - 1) * dt)
     t_eval = np.linspace(t_span[0], t_span[1], T)
-    sol = solve_ivp(
-        lorenz_rhs,
-        t_span,
-        [x0, y0, z0],
-        t_eval=t_eval,
-        rtol=1e-6,
-        atol=1e-9,
-    )
+    sol = solve_ivp(lorenz_rhs, t_span, [x0, y0, z0], t_eval=t_eval, rtol=1e-6, atol=1e-9)
     traj = sol.y.T  # (T, 3)
     return traj
 
@@ -262,7 +248,7 @@ def encode_mixed_radix_states(
     For K components and L levels per component, each patch's discrete
     state is:
 
-      s = sum_{k=0..K-1} q_coeffs[n, k] * L^k
+        s = sum_{k=0..K-1} q_coeffs[n, k] * L^k
 
     Args:
       q_coeffs: (N, K) integer quantized coefficients
@@ -293,7 +279,7 @@ def build_lorenz_patch_dataset(
     Build a dataset for the Lorenz RGM at the patch level.
 
     Steps:
-      1. Simulate a Lorenz trajectory of length T (this T will be T0 in RGM).
+      1. Simulate a Lorenz trajectory of length T.
       2. Render the trajectory into grayscale images of size img_size x img_size.
       3. Extract non-overlapping patches of size patch_size x patch_size
          from each image.
@@ -303,7 +289,7 @@ def build_lorenz_patch_dataset(
          per patch, giving discrete level-0 states.
 
     Args:
-      T: number of time steps (T0 at the lowest RGM level)
+      T: number of time steps
       dt: time step for Lorenz simulation
       img_size: size of rendered images (pixels)
       patch_size: patch side length (pixels)
@@ -318,13 +304,13 @@ def build_lorenz_patch_dataset(
         - 'patches': (N, P) flattened patches
         - 'q_coeffs': (N, K) quantized coefficient indices
         - 'states': (N,) integer discrete states per patch
-        - 'T': T (interpreted as T0 in RGM)
+        - 'T': T
         - 'dt': dt
         - 'img_size': img_size
         - 'patch_size': patch_size
         - 'H_blocks', 'W_blocks': patch grid dimensions
         - 'K', 'L': SVD/quantization config
-        - 'svd_U', 'svd_S', 'svd_Vt': SVD factors
+        - 'svd_U', 'svd_S', 'svd_Vt': SVD components
         - 'bin_edges', 'bin_centers': quantization metadata
     """
     # 1. Simulate Lorenz
@@ -368,12 +354,5 @@ def build_lorenz_patch_dataset(
         "bin_edges": bin_edges,
         "bin_centers": bin_centers,
     }
-
-    if DEBUG_DATA:
-        print("[build_lorenz_patch_dataset] Summary:")
-        print("  T =", T, "img_size =", img_size, "patch_size =", patch_size)
-        print("  H_blocks =", H_blocks, "W_blocks =", W_blocks, "K =", K, "L =", L)
-        print("  states range:", int(states.min()), "to", int(states.max()))
-        print("  q_coeffs[0:3] =", q_coeffs[:3])
 
     return lorenz_data_dict
