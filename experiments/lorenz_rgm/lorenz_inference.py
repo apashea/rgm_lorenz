@@ -20,11 +20,10 @@ to realize the RGM-style pixels-to-planning architecture.
 The implementation here is optimized by:
 - Vectorizing higher-level VMP over spatial sites using vmap (no Python
   loops over (h,w) at parent/child levels).
-- Wrapping the full hierarchical inference entry point in jax.jit to
-  compile the entire computation graph.
 
-These optimizations preserve the underlying graphical model and
-variational updates, and are therefore faithful to the RGM formulation.
+We do NOT jit the full hierarchical inference entry point here, because
+hierarchy and params are Python objects (not pure JAX arrays). That can
+be revisited later by registering them as pytrees or marking them static.
 """
 
 from typing import List, Dict, Any, Tuple, Optional
@@ -50,16 +49,6 @@ DEBUG_INFERENCE = False
 def build_lowest_level_observations_flat(
     lorenz_data_dict: Dict[str, Any],
 ) -> jnp.ndarray:
-    """
-    Build a flat observation array suitable for lowest-level inference.
-
-    We treat the quantized coefficients as "observations" in a one-hot form
-    that is consistent with the A built in lorenz_model.py.
-
-    Returns:
-      obs_flat: (N, O) array, where N = T * H_blocks * W_blocks,
-                O = K * L.
-    """
     q_coeffs = lorenz_data_dict["q_coeffs"]  # (N, K)
     K = int(lorenz_data_dict["K"])
     L = int(lorenz_data_dict["L"])
@@ -86,17 +75,11 @@ def build_lowest_level_observations_flat(
 def build_lowest_level_observations_grid(
     lorenz_data_dict: Dict[str, Any],
 ) -> jnp.ndarray:
-    """
-    Build an observation array reshaped as (T, H0, W0, O) for patch-wise
-    inference.
-    """
     obs_flat = build_lowest_level_observations_flat(lorenz_data_dict)  # (N, O)
     T0 = int(lorenz_data_dict["T"])
     H0 = int(lorenz_data_dict["H_blocks"])
     W0 = int(lorenz_data_dict["W_blocks"])
-
-    obs_grid = obs_flat.reshape(T0, H0, W0, obs_flat.shape[1])
-    return obs_grid
+    return obs_flat.reshape(T0, H0, W0, obs_flat.shape[1])
 
 
 def prefs_from_params(
@@ -104,17 +87,6 @@ def prefs_from_params(
     K: int,
     L: int,
 ) -> jnp.ndarray:
-    """
-    Derive a categorical preference distribution C over lowest-level
-    outcomes from pref_alpha stored in LorenzRGMParams.
-
-    Args:
-      params: LorenzRGMParams with pref_alpha
-      K, L: lowest-level configuration (O0 = K * L)
-
-    Returns:
-      C: (O0,) normalized preference distribution
-    """
     O0 = K * L
     C = params.pref_alpha / (params.pref_alpha.sum() + 1e-8)
     assert C.shape[0] == O0, "prefs_from_params: pref_alpha shape mismatch with K*L."
@@ -131,18 +103,6 @@ def vmp_single_chain(
     obs: jnp.ndarray,
     num_iter: int = 8,
 ) -> jnp.ndarray:
-    """
-    Variational message passing for a single chain of hidden states.
-
-    Args:
-      A: (S, O)
-      B: (S, S)
-      E: (S,)
-      obs: (T, O)
-
-    Returns:
-      qs: (T, S)
-    """
     T = obs.shape[0]
     S = A.shape[0]
 
@@ -189,7 +149,7 @@ def vmp_single_chain(
     return qs
 
 # -----------------------------------------------------------------------------
-# 3. Patch-wise lowest-level inference (loop over patches, unchanged)
+# 3. Patch-wise lowest-level inference (unchanged)
 # -----------------------------------------------------------------------------
 
 def infer_lowest_level_patches(
@@ -197,16 +157,6 @@ def infer_lowest_level_patches(
     lorenz_data_dict: Dict[str, Any],
     num_iter_lowest: int = 8,
 ) -> jnp.ndarray:
-    """
-    Run VMP at the lowest level independently for each patch.
-
-    For now, we approximate temporal dynamics at level 0 with an identity
-    kernel (persistence), since all path-dependent dynamics are attached
-    to higher levels.
-
-    Returns:
-      qs0_grid: (T0, H0, W0, S0)
-    """
     A0 = level0.A
     E0 = level0.E_states
 
@@ -226,8 +176,7 @@ def infer_lowest_level_patches(
             qs_chain = vmp_single_chain_jit(A0, B0, E0, obs_patch, num_iter=num_iter_lowest)
             qs0_host[:, h0, w0, :] = np.array(qs_chain)
 
-    qs0_grid = jnp.array(qs0_host)
-    return qs0_grid
+    return jnp.array(qs0_host)
 
 # -----------------------------------------------------------------------------
 # 4. Bottom-up and top-down messages via D_state_from_parent
@@ -238,17 +187,6 @@ def bottom_up_message_child_to_parent(
     D_parent: jnp.ndarray,
     states_grid_parent: jnp.ndarray,
 ) -> jnp.ndarray:
-    """
-    Bottom-up pseudo-likelihood from a child level to a parent level via D.
-
-    Args:
-      qs_child_grid: (T, H_child, W_child, S_child)
-      D_parent: (S_parent, 4) integer child-state indices per parent state
-      states_grid_parent: (T, H_parent, W_parent)
-
-    Returns:
-      log_lik_parent: (T, H_parent, W_parent, S_parent)
-    """
     T, Hc, Wc, S_child = qs_child_grid.shape
     T1, Hp, Wp = states_grid_parent.shape
     assert T == T1
@@ -282,8 +220,7 @@ def bottom_up_message_child_to_parent(
 
         return jax.vmap(jax.vmap(score_site, in_axes=0), in_axes=0)(qs_children_t)
 
-    log_lik_parent = jax.vmap(score_all_sites)(qs_children)  # (T, Hp, Wp, S_parent)
-    return log_lik_parent
+    return jax.vmap(score_all_sites)(qs_children)  # (T, Hp, Wp, S_parent)
 
 
 def top_down_prior_parent_to_child(
@@ -293,18 +230,6 @@ def top_down_prior_parent_to_child(
     W_child: int,
     S_child: int,
 ) -> jnp.ndarray:
-    """
-    Build a top-down log prior bias over child states from parent posteriors
-    using D_state_from_parent.
-
-    Args:
-      qs_parent_grid: (T, Hp, Wp, S_parent)
-      D_parent: (S_parent, 4) mapping parent->child states
-      H_child, W_child, S_child: child grid sizes
-
-    Returns:
-      log_prior_bias_child: (T, H_child, W_child, S_child)
-    """
     T, Hp, Wp, S_parent = qs_parent_grid.shape
     assert H_child == 2 * Hp and W_child == 2 * Wp
 
@@ -335,8 +260,7 @@ def top_down_prior_parent_to_child(
                     bias = bias.at[hc, wc, :].set(log_accum)
         return bias
 
-    log_prior_bias_child = jax.vmap(bias_for_time)(jnp.arange(T))  # (T, Hc, Wc, S_child)
-    return log_prior_bias_child
+    return jax.vmap(bias_for_time)(jnp.arange(T))  # (T, Hc, Wc, S_child)
 
 # -----------------------------------------------------------------------------
 # 5. Vectorized two-level VMP (child-parent) over spatial sites
@@ -348,18 +272,6 @@ def _vmp_parent_chain(
     B_chain: jnp.ndarray,
     num_iter: int,
 ) -> jnp.ndarray:
-    """
-    VMP for a single parent site chain given time-varying temporal kernel.
-
-    Args:
-      log_lik_chain: (T, S_parent)
-      E_parent: (S_parent,)
-      B_chain: (T, S_parent, S_parent)
-      num_iter: number of iterations
-
-    Returns:
-      qs_parent_chain: (T, S_parent)
-    """
     T, S_parent = log_lik_chain.shape
 
     def forward_messages(qs_):
@@ -405,18 +317,6 @@ def _vmp_child_chain(
     B_child: jnp.ndarray,
     num_iter: int,
 ) -> jnp.ndarray:
-    """
-    VMP for a single child site chain with identity kernel (or fixed B_child).
-
-    Args:
-      log_bias_chain: (T, S_child)
-      E_child: (S_child,)
-      B_child: (S_child, S_child)
-      num_iter: iterations
-
-    Returns:
-      qs_child_chain: (T, S_child)
-    """
     T, S_child = log_bias_chain.shape
 
     def forward_messages(qs_):
@@ -462,32 +362,12 @@ def vmp_two_level_states(
     qu_parent: Optional[jnp.ndarray] = None,
     num_iter: int = 2,
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
-    """
-    Coupled VMP over child and parent states with optional path-dependent
-    dynamics at the parent level.
-
-    This version is vectorized over spatial sites using vmap: each parent
-    (and corresponding child group) is treated as an independent chain, but
-    the update equations are identical to the original per-site code.
-
-    Args:
-      level_child: lower LorenzLevel
-      level_parent: parent LorenzLevel
-      qs_child_grid: (T, Hc, Wc, S_child)
-      states_grid_parent: (T, Hp, Wp)
-      qu_parent: (T, U) or None (path posterior at this level)
-      num_iter: alternating sweeps
-
-    Returns:
-      qs_child_final: (T, Hc, Wc, S_child)
-      qs_parent_final: (T, Hp, Wp, S_parent)
-    """
     E_child = level_child.E_states
     S_child = E_child.shape[0]
 
     E_parent = level_parent.E_states
-    D_parent = level_parent.D_state_from_parent  # (S_parent, 4)
-    B_states_paths_parent = level_parent.B_states_paths  # (S_parent, S_parent, U) or None
+    D_parent = level_parent.D_state_from_parent
+    B_states_paths_parent = level_parent.B_states_paths
 
     T, Hc, Wc, _ = qs_child_grid.shape
     T1, Hp, Wp = states_grid_parent.shape
@@ -499,7 +379,7 @@ def vmp_two_level_states(
 
     S_parent = E_parent.shape[0]
 
-    # Effective temporal kernel at parent for each time
+    # Effective temporal kernel at parent
     if B_states_paths_parent is None:
         B_parent_all = jnp.broadcast_to(
             jnp.eye(S_parent, dtype=jnp.float32), (T, S_parent, S_parent)
@@ -512,53 +392,45 @@ def vmp_two_level_states(
             qu_parent_eff = qu_parent
 
         def B_eff_for_time(t):
-            qu_t = qu_parent_eff[t]  # (U,)
-            return (B_states_paths_parent * qu_t[None, None, :]).sum(axis=2)  # (S_parent, S_parent)
+            qu_t = qu_parent_eff[t]
+            return (B_states_paths_parent * qu_t[None, None, :]).sum(axis=2)
 
         B_parent_all = jax.vmap(B_eff_for_time)(jnp.arange(T))  # (T, S_parent, S_parent)
 
-    # Initialize parent states uniformly
     qs_parent_grid = jnp.full(
         (T, Hp, Wp, S_parent), 1.0 / S_parent, dtype=jnp.float32
     )
 
-    # Identity kernel at child in this block
     B_child = jnp.eye(S_child, dtype=jnp.float32)
-
-    # ----- Alternating updates -----
 
     def alt_step(_, carry):
         qs_child_curr, qs_parent_curr = carry
 
-        # 1) Update parent given current child
+        # Parent update
         log_lik_parent = bottom_up_message_child_to_parent(
             qs_child_curr, D_parent, states_grid_parent
         )  # (T, Hp, Wp, S_parent)
 
-        # Flatten parent spatial dims to a site axis
-        log_lik_flat = log_lik_parent.reshape(T, Hp * Wp, S_parent)  # (T, Np, S_parent)
-        B_chain = B_parent_all  # (T, S_parent, S_parent)
+        log_lik_flat = log_lik_parent.reshape(T, Hp * Wp, S_parent)
 
-        # VMP per parent site chain
         vmp_parent_site = lambda log_chain: _vmp_parent_chain(
-            log_chain, E_parent, B_chain, num_iter=2
-        )  # (T, S_parent)
+            log_chain, E_parent, B_parent_all, num_iter=2
+        )
         qs_parent_flat = jax.vmap(vmp_parent_site, in_axes=1, out_axes=1)(
             log_lik_flat
         )  # (T, Np, S_parent)
         qs_parent_new = qs_parent_flat.reshape(T, Hp, Wp, S_parent)
 
-        # 2) Update child given updated parent
+        # Child update
         log_prior_bias_child = top_down_prior_parent_to_child(
             qs_parent_new, D_parent, Hc, Wc, S_child
         )  # (T, Hc, Wc, S_child)
 
-        # Flatten child spatial dims
-        log_bias_flat = log_prior_bias_child.reshape(T, Hc * Wc, S_child)  # (T, Nc, S_child)
+        log_bias_flat = log_prior_bias_child.reshape(T, Hc * Wc, S_child)
 
         vmp_child_site = lambda log_chain: _vmp_child_chain(
             log_chain, E_child, B_child, num_iter=1
-        )  # (T, S_child)
+        )
         qs_child_flat = jax.vmap(vmp_child_site, in_axes=1, out_axes=1)(
             log_bias_flat
         )  # (T, Nc, S_child)
@@ -584,22 +456,16 @@ def _infer_lorenz_hierarchy_inner(
     efe_gamma: float,
     pref_mode: str,
 ) -> Dict[str, Any]:
-    """
-    Pure JAX-compatible inner function implementing the core inference logic.
-    This is separated so we can wrap it in jax.jit without Python side-effects.
-    """
     T0 = hierarchy.T0
     H0 = hierarchy.H_blocks
     W0 = hierarchy.W_blocks
 
     level0: LorenzLevel = hierarchy.levels[0]
-    A0 = level0.A
 
     obs_flat = build_lowest_level_observations_flat(lorenz_data_dict)  # (N, O)
     N = obs_flat.shape[0]
     assert N == T0 * H0 * W0, "Observation length mismatch."
 
-    # Preferences: from params.pref_alpha if available, else empirical fallback
     if params is not None:
         K = int(lorenz_data_dict["K"])
         L = int(lorenz_data_dict["L"])
@@ -608,7 +474,7 @@ def _infer_lorenz_hierarchy_inner(
         C = obs_flat.mean(axis=0)
         C = C / (C.sum() + 1e-8)
 
-    # 1. Level-0 states
+    # Level 0
     qs0_grid = infer_lowest_level_patches(
         level0, lorenz_data_dict, num_iter_lowest=num_iter_lowest
     )
@@ -616,18 +482,13 @@ def _infer_lorenz_hierarchy_inner(
     num_levels = len(hierarchy.levels)
     qs_levels: List[Optional[jnp.ndarray]] = [None] * num_levels
     qu_levels: List[Optional[jnp.ndarray]] = [None] * num_levels
-
     qs_levels[0] = qs0_grid
 
-    # Early exit if only one level
     if num_levels == 1:
         return {"qs_levels": qs_levels, "qu_levels": qu_levels}
 
-    # 2. Higher levels (generalized): build qs_l grids for all l >= 1
     states_grids = hierarchy.states_grids
     qs_current: List[Optional[jnp.ndarray]] = [None] * num_levels
-
-    # Level 0 is already inferred
     qs_current[0] = qs0_grid
 
     for l in range(1, num_levels):
@@ -635,14 +496,12 @@ def _infer_lorenz_hierarchy_inner(
         states_grid_l = states_grids[l]
         Tl, Hl, Wl = states_grid_l.shape
         assert Tl == T0
-        qs_l = jnp.full(
+        qs_current[l] = jnp.full(
             (T0, Hl, Wl, level_l.S),
             1.0 / level_l.S,
             dtype=jnp.float32,
         )
-        qs_current[l] = qs_l
 
-    # Determine top level carrying paths (by level index)
     top_idx = None
     for idx in reversed(range(num_levels)):
         lvl = hierarchy.levels[idx]
@@ -664,11 +523,9 @@ def _infer_lorenz_hierarchy_inner(
         level_top = None
         qu_top = None
 
-    # Hierarchical inference: alternate bottom-up / top-down across all levels
     qu_top_current = qu_top
 
     for _ in range(num_iter_hier):
-        # Upward passes: 0 <-> 1, 1 <-> 2, ..., (L-2) <-> (L-1)
         for l_child in range(num_levels - 1):
             l_parent = l_child + 1
             level_child = hierarchy.levels[l_child]
@@ -678,11 +535,9 @@ def _infer_lorenz_hierarchy_inner(
             qs_parent = qs_current[l_parent]
             states_grid_parent = states_grids[l_parent]
 
-            # Only run coupled block if this parent has a D_state_from_parent
             if level_parent.D_state_from_parent is None:
                 continue
 
-            # Path posterior only at the top path level
             qu_parent = None
             if paths_active and (l_parent == top_idx):
                 qu_parent = qu_top_current
@@ -699,7 +554,6 @@ def _infer_lorenz_hierarchy_inner(
             qs_current[l_child] = qs_child_new
             qs_current[l_parent] = qs_parent_new
 
-        # Path update if active
         if paths_active:
             qs_top_grid = qs_current[top_idx]
             level0_for_efe = level0
@@ -720,7 +574,6 @@ def _infer_lorenz_hierarchy_inner(
                 num_iter=2,
             )
 
-    # Collect results per level
     for l in range(num_levels):
         qs_levels[l] = qs_current[l]
 
@@ -731,13 +584,6 @@ def _infer_lorenz_hierarchy_inner(
         "qs_levels": qs_levels,
         "qu_levels": qu_levels,
     }
-
-
-# JIT-compiled wrapper around the pure inner function
-infer_lorenz_hierarchy_jit = jax.jit(
-    _infer_lorenz_hierarchy_inner,
-    static_argnames=("num_iter_lowest", "num_iter_hier", "pref_mode"),
-)
 
 def infer_lorenz_hierarchy(
     hierarchy: LorenzHierarchy,
@@ -752,11 +598,11 @@ def infer_lorenz_hierarchy(
     Public entry point for variational inference over states and (optional)
     paths in the Lorenz hierarchy.
 
-    This function dispatches to a JIT-compiled inner implementation to
-    ensure efficient execution while preserving the RGM's structure and
-    update equations.
+    This calls the inner implementation WITHOUT jitting hierarchy/params,
+    to avoid type issues with non-array arguments. The core RGM structure
+    and update equations are unchanged.
     """
-    return infer_lorenz_hierarchy_jit(
+    return _infer_lorenz_hierarchy_inner(
         hierarchy=hierarchy,
         lorenz_data_dict=lorenz_data_dict,
         params=params,
