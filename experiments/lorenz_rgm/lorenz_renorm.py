@@ -1,168 +1,404 @@
 # lorenz_renorm.py
 """
-Renormalisation (RG) utilities for the Lorenz RGM.
+Spatial renormalisation (RG) for the Lorenz RGM example.
 
-This module constructs a spatial hierarchy of discrete states from
-lowest-level patch states by grouping 2x2 blocks of child sites into
-parent sites. It produces:
+This module:
+1. Takes lowest-level patch states on a 2D grid over time.
+2. Groups non-overlapping 2x2 blocks of child sites into parent "groups".
+3. Assigns a unique parent state to each distinct 2x2 child pattern
+   within each group-site.
+4. Builds a D tensor encoding the deterministic mapping from parent
+   states to child configurations, with:
+   - no shared children between different group-sites,
+   - unique child patterns (rows) for each parent state.
+5. Supports recursive application to build an arbitrary number of
+   spatial levels via repeated 2x2 RG steps.
+6. Provides a consistency check to verify that D and the parent states
+   are consistent with the original child patterns.
 
-- A list of levels, each with:
-    * 'states_grid': (T, H_l, W_l) integer state labels
-    * 'D': (S_l, 4) deterministic mapping from each parent state to the
-           states of its 4 children (for l > 0)
-
-- Top-level metadata:
-    * 'H_blocks', 'W_blocks': lowest-level patch grid size
-    * 'T': number of time steps
-
-CURRENT STATUS (to be extended):
-
-- We support one RG step (num_levels = 1) by default:
-    level 0: patch-level states
-    level 1: first parent-level states (2x2 blocks of level 0)
-- D is a fixed, deterministic RG operator built from observed child
-  configurations; no structure learning is applied yet.
-- Future work will:
-    - add a second RG step (level 2) to obtain a 3-level hierarchy, and
-    - introduce structure learning updates for D based on state
-      co-occurrences across levels.
+All functions are written in a level-agnostic way so they can be used
+for 1, 2, or more RG steps without renaming or re-structuring code.
 """
 
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, Tuple, List, Optional
 
 import numpy as np
 import jax.numpy as jnp
 
 
-def build_level_from_children(
-    child_states_grid: jnp.ndarray,
-) -> Tuple[jnp.ndarray, jnp.ndarray]:
-    """
-    Given a child level with states_grid of shape (T, H_child, W_child),
-    build the next parent level by grouping each 2x2 block of child sites
-    into a single parent site.
+# -----------------------------------------------------------------------------
+# 1. Utilities: reshape between flat and grid states
+# -----------------------------------------------------------------------------
 
-    This function:
-    - Enumerates all unique 2x2 child state configurations observed over
-      time and space.
-    - Assigns each unique configuration an integer parent state index s_parent.
-    - Constructs:
-        * parent_states_grid: (T, H_parent, W_parent)
-        * D_parent: (S_parent, 4) mapping parent state -> 4 child states
+def states_flat_to_grid(
+    states_flat: jnp.ndarray,
+    T: int,
+    H_blocks: int,
+    W_blocks: int,
+) -> jnp.ndarray:
+    """
+    Reshape flat patch states into a 3D grid over time.
 
     Args:
-        child_states_grid: (T, H_child, W_child) integer child states
+        states_flat: (T * H_blocks * W_blocks,) integer states
+        T: number of time steps
+        H_blocks: number of patch rows at level 0
+        W_blocks: number of patch columns at level 0
 
     Returns:
-        parent_states_grid: (T, H_parent, W_parent) integer parent states
-        D_parent: (S_parent, 4) array of child state patterns
+        states_grid: (T, H_blocks, W_blocks) integer states
     """
-    T, Hc, Wc = child_states_grid.shape
-    assert Hc % 2 == 0 and Wc % 2 == 0, "Child grid must have even dimensions."
+    return states_flat.reshape(T, H_blocks, W_blocks)
 
-    Hp = Hc // 2
-    Wp = Wc // 2
 
-    # Collect all 2x2 configurations over time and space
-    configs = []
+def states_grid_to_flat(states_grid: jnp.ndarray) -> jnp.ndarray:
+    """
+    Flatten (T, H, W) states back to a 1D array.
+
+    Args:
+        states_grid: (T, H, W)
+
+    Returns:
+        states_flat: (T * H * W,)
+    """
+    T, H, W = states_grid.shape
+    return states_grid.reshape(T * H * W,)
+
+
+# -----------------------------------------------------------------------------
+# 2. Single RG step over space (2x2 blocks) with explicit mapping
+# -----------------------------------------------------------------------------
+
+def _build_parent_mapping_for_group_explicit(
+    child_patterns: np.ndarray,
+) -> Tuple[np.ndarray, Dict[Tuple[int, ...], int]]:
+    """
+    Build mapping from child 4-tuples to local parent indices for a
+    single group-site, scanning over time.
+
+    Args:
+        child_patterns: (T, 4) integer child states for one group-site
+            across all time points.
+
+    Returns:
+        parent_ids: (T,) array of local parent state indices (int64)
+        pattern_to_parent: dict mapping pattern tuples -> local index
+    """
+    T = child_patterns.shape[0]
+    pattern_to_parent: Dict[Tuple[int, ...], int] = {}
+    parent_ids_list: List[int] = []
+
+    next_idx = 0
     for t in range(T):
-        for h in range(Hp):
-            for w in range(Wp):
-                c00 = int(child_states_grid[t, 2 * h, 2 * w])
-                c01 = int(child_states_grid[t, 2 * h, 2 * w + 1])
-                c10 = int(child_states_grid[t, 2 * h + 1, 2 * w])
-                c11 = int(child_states_grid[t, 2 * h + 1, 2 * w + 1])
-                configs.append((c00, c01, c10, c11))
+        pattern = tuple(child_patterns[t].tolist())  # (4,)
+        if pattern in pattern_to_parent:
+            idx = pattern_to_parent[pattern]
+        else:
+            idx = next_idx
+            pattern_to_parent[pattern] = idx
+            next_idx += 1
+        parent_ids_list.append(idx)
 
-    # Unique configurations -> parent state indices
-    unique_configs = sorted(set(configs))
-    pattern_to_parent = {cfg: idx for idx, cfg in enumerate(unique_configs)}
-    S_parent = len(unique_configs)
+    parent_ids = np.asarray(parent_ids_list, dtype=np.int64)  # (T,)
+    return parent_ids, pattern_to_parent
 
-    # Build D_parent mapping
-    D_parent = np.zeros((S_parent, 4), dtype=np.int32)
-    for s_parent, cfg in enumerate(unique_configs):
-        c00, c01, c10, c11 = cfg
-        D_parent[s_parent, 0] = c00
-        D_parent[s_parent, 1] = c01
-        D_parent[s_parent, 2] = c10
-        D_parent[s_parent, 3] = c11
-    D_parent = jnp.array(D_parent)
 
-    # Build parent_states_grid
-    parent_states_grid = np.zeros((T, Hp, Wp), dtype=np.int32)
-    for t in range(T):
-        for h in range(Hp):
-            for w in range(Wp):
-                c00 = int(child_states_grid[t, 2 * h, 2 * w])
-                c01 = int(child_states_grid[t, 2 * h, 2 * w + 1])
-                c10 = int(child_states_grid[t, 2 * h + 1, 2 * w])
-                c11 = int(child_states_grid[t, 2 * h + 1, 2 * w + 1])
-                cfg = (c00, c01, c10, c11)
-                parent_states_grid[t, h, w] = pattern_to_parent[cfg]
+def rg_step_level(states_grid: jnp.ndarray) -> Dict[str, Any]:
+    """
+    Perform a single spatial RG step over a grid of states.
 
-    parent_states_grid = jnp.array(parent_states_grid)
+    We:
+      - assume H and W are even (non-overlapping 2x2 groups),
+      - group 2x2 blocks into "group-sites" with four child positions,
+      - for each group-site (h2,w2), build a local mapping from unique
+        child patterns to parent states, ensuring:
+          * no shared children between different group-sites (by construction),
+          * unique rows in D for each parent (one row per pattern).
 
-    return parent_states_grid, D_parent
+    Args:
+        states_grid: (T, H, W) integer states at current level.
 
+    Returns:
+        dict with:
+          'parent_states_grid': (T, H2, W2) integer parent states
+          'group_pattern_maps': list (length H2 * W2) of dicts
+              pattern_tuple (4,) -> parent_state_idx (global int)
+          'D': (num_parent_states_total, 4) child state patterns
+          'group_shape': (H2, W2)
+          'num_parent_states_total': total number of parent states
+    """
+    T, H, W = states_grid.shape
+    assert H % 2 == 0 and W % 2 == 0, "H and W must be even for 2x2 grouping."
+
+    H2, W2 = H // 2, W // 2
+
+    # Extract 2x2 child patterns per group-site and time:
+    c00 = states_grid[:, 0::2, 0::2]
+    c01 = states_grid[:, 0::2, 1::2]
+    c10 = states_grid[:, 1::2, 0::2]
+    c11 = states_grid[:, 1::2, 1::2]
+
+    combo = jnp.stack([c00, c01, c10, c11], axis=-1)  # (T, H2, W2, 4)
+    combo_np = np.array(combo, dtype=np.int32)
+
+    group_pattern_maps: List[Dict[Tuple[int, ...], int]] = []
+    parent_states_grid_np = np.zeros((T, H2, W2), dtype=np.int32)
+
+    D_rows: List[Tuple[int, ...]] = []
+    global_parent_index = 0
+
+    for h2 in range(H2):
+        for w2 in range(W2):
+            # All timepoints for this group-site: (T, 4)
+            patterns_hw = combo_np[:, h2, w2, :]  # (T, 4)
+
+            parent_ids_local, pattern_to_parent_local = \
+                _build_parent_mapping_for_group_explicit(patterns_hw)
+
+            # Assign global parent indices for each local parent
+            local_to_global: Dict[int, int] = {}
+            for pattern, local_idx in pattern_to_parent_local.items():
+                local_idx_int = int(local_idx)
+                global_idx = global_parent_index
+                global_parent_index += 1
+                local_to_global[local_idx_int] = global_idx
+                D_rows.append(pattern)  # row for this global parent
+
+            # Map local parent ids to global parent ids over time
+            parent_ids_global = np.array(
+                [local_to_global[int(loc_idx)] for loc_idx in parent_ids_local],
+                dtype=np.int32,
+            )
+            parent_states_grid_np[:, h2, w2] = parent_ids_global
+
+            # Store mapping for this group-site (global indices)
+            pattern_to_global = {
+                pattern: local_to_global[int(local_idx)]
+                for pattern, local_idx in pattern_to_parent_local.items()
+            }
+            group_pattern_maps.append(pattern_to_global)
+
+    parent_states_grid = jnp.array(parent_states_grid_np, dtype=jnp.int32)
+    D = jnp.array(D_rows, dtype=jnp.int32)  # (num_parent_states_total, 4)
+    num_parent_states_total = int(D.shape[0])
+
+    return {
+        "parent_states_grid": parent_states_grid,
+        "group_pattern_maps": group_pattern_maps,
+        "D": D,
+        "group_shape": (H2, W2),
+        "num_parent_states_total": num_parent_states_total,
+    }
+
+
+# -----------------------------------------------------------------------------
+# 3. Recursive RG across multiple spatial levels (level-agnostic)
+# -----------------------------------------------------------------------------
+
+def build_spatial_hierarchy(
+    states_flat: jnp.ndarray,
+    T: int,
+    H_blocks: int,
+    W_blocks: int,
+    num_levels: int = 1,
+) -> Dict[str, Any]:
+    """
+    Build a spatial hierarchy via repeated 2x2 RG steps, starting from
+    lowest-level patch states.
+
+    Args:
+        states_flat: (T * H_blocks * W_blocks,) integer states at level 0
+        T: number of time steps
+        H_blocks: number of patch rows at level 0
+        W_blocks: number of patch columns at level 0
+        num_levels: number of RG steps to apply:
+            - num_levels = 0: only level 0 (patch level)
+            - num_levels = 1: levels 0 and 1 (one RG step)
+            - num_levels = 2: levels 0,1,2 (two RG steps), etc.
+
+    Returns:
+        dict with:
+          'levels': list of level dicts, l = 0..L
+              level[0]:
+                {'states_grid': (T,H0,W0),
+                 'group_shape': (H0,W0),
+                 'D': None,
+                 'group_pattern_maps': None}
+              level[l>0]:
+                {'states_grid': (T,H_l,W_l),
+                 'group_shape': (H_l,W_l),
+                 'D': (S_l,4),
+                 'group_pattern_maps': list of dicts}
+          'T': T
+    """
+    assert num_levels >= 0, "num_levels must be >= 0."
+
+    # Level 0: reshape lowest-level patch states to grid
+    states_grid_0 = states_flat_to_grid(states_flat, T, H_blocks, W_blocks)
+
+    levels: List[Dict[str, Any]] = []
+    levels.append(
+        {
+            "states_grid": states_grid_0,
+            "group_shape": (H_blocks, W_blocks),
+            "D": None,
+            "group_pattern_maps": None,
+        }
+    )
+
+    current_states_grid = states_grid_0
+    current_H, current_W = H_blocks, W_blocks
+
+    # Apply num_levels RG steps
+    for level_idx in range(1, num_levels + 1):
+        if current_H % 2 != 0 or current_W % 2 != 0:
+            raise ValueError(
+                f"Cannot build level {level_idx}: "
+                f"current grid size ({current_H}, {current_W}) is not even."
+            )
+
+        rg_result = rg_step_level(current_states_grid)
+        parent_states_grid = rg_result["parent_states_grid"]
+        H2, W2 = rg_result["group_shape"]
+
+        level_dict = {
+            "states_grid": parent_states_grid,
+            "group_shape": (H2, W2),
+            "D": rg_result["D"],
+            "group_pattern_maps": rg_result["group_pattern_maps"],
+        }
+        levels.append(level_dict)
+
+        current_states_grid = parent_states_grid
+        current_H, current_W = H2, W2
+
+    return {
+        "levels": levels,
+        "T": T,
+    }
+
+
+# -----------------------------------------------------------------------------
+# 4. Convenience wrapper: from lorenz_data output
+# -----------------------------------------------------------------------------
 
 def build_lorenz_spatial_hierarchy(
     lorenz_data_dict: Dict[str, Any],
     num_levels: int = 1,
 ) -> Dict[str, Any]:
     """
-    Build a spatial RG hierarchy of discrete states for the Lorenz data.
-
-    Starting from lowest-level patch states, we apply num_levels steps of
-    2x2 grouping to obtain coarser spatial levels.
+    Given the output of lorenz_data.build_lorenz_patch_dataset, build the
+    spatial RG hierarchy via repeated 2x2 steps.
 
     Args:
-        lorenz_data_dict: output from build_lorenz_patch_dataset, containing:
-            - 'states': (T * H_blocks * W_blocks,) lowest-level state labels
-            - 'T': number of time steps
-            - 'H_blocks', 'W_blocks': patch grid dimensions
-        num_levels: number of RG steps to apply (currently 1 by default):
-            num_levels = 0: only level 0 (patch level)
-            num_levels = 1: levels 0 and 1 (one RG step)
+        lorenz_data_dict: dict returned by build_lorenz_patch_dataset
+            (must contain 'states', 'T', 'H_blocks', 'W_blocks')
+        num_levels: number of RG steps above the patch level to build
 
     Returns:
-        spatial_hierarchy: dict with keys:
-            - 'levels': list of dicts, level 0..L:
-                * level[0]: {'states_grid': (T,H0,W0)}
-                * level[1]: {'states_grid': (T,H1,W1), 'D': (S1,4)}
-                * (future) level[2]: {'states_grid': (T,H2,W2), 'D': (S2,4)}, ...
-            - 'H_blocks', 'W_blocks': lowest-level H0, W0
-            - 'T': number of time steps
+        dict with:
+          'levels': list of level dicts (see build_spatial_hierarchy)
+          'T': T
+          plus copies of useful fields from lorenz_data_dict:
+            'H_blocks', 'W_blocks', 'K', 'L', 'patch_size', 'img_size'
     """
+    states_flat = lorenz_data_dict["states"]
+    T = int(lorenz_data_dict["T"])
+    H_blocks = int(lorenz_data_dict["H_blocks"])
+    W_blocks = int(lorenz_data_dict["W_blocks"])
+
+    hierarchy = build_spatial_hierarchy(
+        states_flat,
+        T,
+        H_blocks,
+        W_blocks,
+        num_levels=num_levels,
+    )
+
+    result = {
+        "T": hierarchy["T"],
+        "levels": hierarchy["levels"],
+        "H_blocks": H_blocks,
+        "W_blocks": W_blocks,
+        "K": int(lorenz_data_dict["K"]),
+        "L": int(lorenz_data_dict["L"]),
+        "patch_size": int(lorenz_data_dict["patch_size"]),
+        "img_size": int(lorenz_data_dict["img_size"]),
+    }
+    return result
+
+
+# -----------------------------------------------------------------------------
+# 5. Consistency check: verify D vs child patterns at level 1
+# -----------------------------------------------------------------------------
+
+def check_spatial_hierarchy_consistency(
+    lorenz_data_dict: Dict[str, Any],
+    spatial_hierarchy: Dict[str, Any],
+    num_samples: int = 10,
+    rng: Optional[np.random.RandomState] = None,
+) -> bool:
+    """
+    Verify that (at least) the first RG level is consistent:
+
+    - For randomly sampled times and group-sites at level 1,
+      the D row corresponding to the parent state matches exactly
+      the 4 child states at level 0.
+
+    Args:
+        lorenz_data_dict: original data dict (for level-0 states)
+        spatial_hierarchy: output of build_lorenz_spatial_hierarchy
+        num_samples: number of (t, h1, w1) samples to check
+        rng: optional numpy RandomState for reproducibility
+
+    Returns:
+        True if all sampled checks pass; raises AssertionError otherwise.
+    """
+    if rng is None:
+        rng = np.random.RandomState(0)
+
+    # Level 0 states grid
     T = int(lorenz_data_dict["T"])
     H0 = int(lorenz_data_dict["H_blocks"])
     W0 = int(lorenz_data_dict["W_blocks"])
+    states_flat = lorenz_data_dict["states"]
+    states_grid_0 = states_flat_to_grid(states_flat, T, H0, W0)
 
-    states_flat = lorenz_data_dict["states"]  # (T * H0 * W0,)
-    states_grid0 = jnp.array(
-        states_flat.reshape(T, H0, W0)
-    )  # (T, H0, W0)
+    levels = spatial_hierarchy["levels"]
+    assert len(levels) >= 2, "Need at least one RG level above patches to check."
 
-    levels: List[Dict[str, Any]] = []
-    levels.append({"states_grid": states_grid0})
+    level1 = levels[1]
+    states_grid_1 = np.array(level1["states_grid"])  # (T, H1, W1)
+    D = np.array(level1["D"])  # (num_parent_states_1, 4)
 
-    current_states_grid = states_grid0
+    T1, H1, W1 = states_grid_1.shape
+    assert T1 == T
+    assert H0 == 2 * H1 and W0 == 2 * W1
 
-    # Apply num_levels RG steps
-    for _ in range(num_levels):
-        parent_states_grid, D_parent = build_level_from_children(current_states_grid)
-        levels.append(
-            {
-                "states_grid": parent_states_grid,
-                "D": D_parent,
-            }
-        )
-        current_states_grid = parent_states_grid
+    # Sample random (t, h1, w1) triples
+    for _ in range(num_samples):
+        t = rng.randint(0, T)
+        h1 = rng.randint(0, H1)
+        w1 = rng.randint(0, W1)
 
-    spatial_hierarchy: Dict[str, Any] = {
-        "levels": levels,
-        "H_blocks": H0,
-        "W_blocks": W0,
-        "T": T,
-    }
-    return spatial_hierarchy
+        parent_state = int(states_grid_1[t, h1, w1])  # index into D
+        pattern_D = D[parent_state]  # (4,)
+
+        # Extract child states from level 0 at this group-site and time
+        h0_0, h0_1 = 2 * h1, 2 * h1 + 1
+        w0_0, w0_1 = 2 * w1, 2 * w1 + 1
+
+        s00 = int(states_grid_0[t, h0_0, w0_0])
+        s01 = int(states_grid_0[t, h0_0, w0_1])
+        s10 = int(states_grid_0[t, h0_1, w0_0])
+        s11 = int(states_grid_0[t, h0_1, w0_1])
+
+        pattern_child = np.array([s00, s01, s10, s11], dtype=np.int32)
+
+        if not np.array_equal(pattern_D, pattern_child):
+            raise AssertionError(
+                f"Inconsistent D at t={t}, h1={h1}, w1={w1}: "
+                f"D row {pattern_D} vs children {pattern_child}"
+            )
+
+    return True
