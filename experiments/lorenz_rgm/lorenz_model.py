@@ -10,10 +10,10 @@ This module defines:
   * Optional spatial mapping D_state_from_parent^l from parent states to
     child state configurations (D tensors)
   * Path factor u^l_t with:
-      - C_paths^l(u_{t+1} | u_t)  (path transitions, "C" in the paper)
-      - E_paths^l(u_1)
-      - B_states_paths^l(s' | s, u) (state transitions conditioned on paths)
-      - E_paths_from_parent^l(u^l | s^{l+1}) (parent state -> child paths, E tensors)
+    - C_paths^l(u_{t+1} | u_t) (path transitions, "C" in the paper)
+    - E_paths^l(u_1)
+    - B_states_paths^l(s' | s, u) (state transitions conditioned on paths)
+    - E_paths_from_parent^l(u^l | s^{l+1}) (parent state -> child paths, E tensors)
 - LorenzHierarchy: a stack of LorenzLevel objects plus structural info,
   including explicit temporal block structure across levels.
 - LorenzRGMParams: Dirichlet concentration parameters for A/D/E/B/C
@@ -63,12 +63,12 @@ class LorenzLevel:
 
       B_states_paths:
         Path-dependent state transitions at this level:
-          B_states_paths[s_next, s, u] = P(s_next | s, u_t = u)
+        B_states_paths[s_next, s, u] = P(s_next | s, u_t = u)
         Shape: (S, S, U) or None if num_paths <= 0.
 
       E_paths_from_parent:
         Mapping from parent state to initial paths at this level:
-          E_paths_from_parent[u, s_parent] ∝ P(u_t = u | s_parent_t = s_parent)
+        E_paths_from_parent[u, s_parent] ∝ P(u_t = u | s_parent_t = s_parent)
         Shape: (U, S_parent) or None for the top level (no parent).
     """
     S: int
@@ -97,8 +97,8 @@ class LorenzHierarchy:
       T0: number of fine (level-0) time steps
       T1: number of level-1 time steps
       T2: number of level-2 time steps
-      K0: number of level-0 steps per level-1 step  (T0 = K0 * T1)
-      K1: number of level-1 steps per level-2 step  (T1 = K1 * T2)
+      K0: number of level-0 steps per level-1 step (T0 = K0 * T1)
+      K1: number of level-1 steps per level-2 step (T1 = K1 * T2)
       H_blocks: number of patch rows at lowest level
       W_blocks: number of patch columns at lowest level
     """
@@ -111,7 +111,6 @@ class LorenzHierarchy:
     K1: int
     H_blocks: int
     W_blocks: int
-
 
 # -----------------------------------------------------------------------------
 # Dirichlet parameter container (for learning)
@@ -141,7 +140,7 @@ class LorenzRGMParams:
 
     Preferences over outcomes at lowest level:
       pref_alpha: (O_0,) Dirichlet concentration over outcome preferences
-        C^0(o) in active inference notation.
+      C^0(o) in active inference notation.
     """
     A_alpha: List[jnp.ndarray]
     E_states_alpha: List[jnp.ndarray]
@@ -154,7 +153,6 @@ class LorenzRGMParams:
     C_paths_alpha: List[Optional[jnp.ndarray]]
 
     pref_alpha: jnp.ndarray
-
 
 # -----------------------------------------------------------------------------
 # Helper functions: constructing A, E, path factors
@@ -267,7 +265,6 @@ def build_uniform_E_paths_from_parent(
     E_map = E_map / (E_map.sum(axis=0, keepdims=True) + 1e-8)
     return jnp.array(E_map)
 
-
 # -----------------------------------------------------------------------------
 # Building the Lorenz hierarchy (fixed parameters, with temporal blocks)
 # -----------------------------------------------------------------------------
@@ -374,6 +371,7 @@ def build_lorenz_hierarchy(
         B_states_paths=B_states_paths0,
         E_paths_from_parent=E_paths_from_parent0,
     )
+
     levels.append(level0)
 
     # Higher spatial levels 1..num_spatial_levels (LorenzLevels 1..)
@@ -428,7 +426,6 @@ def build_lorenz_hierarchy(
     )
 
     return hierarchy
-
 
 # -----------------------------------------------------------------------------
 # Helper: initialize Dirichlet parameters from an existing hierarchy
@@ -533,7 +530,6 @@ def init_dirichlet_params_from_hierarchy(
         C_paths_alpha=C_paths_alpha,
         pref_alpha=pref_alpha,
     )
-
 
 # -----------------------------------------------------------------------------
 # Helper: build hierarchy from learned Dirichlet parameters
@@ -684,6 +680,7 @@ def build_lorenz_hierarchy_from_params(
             B_states_paths=B_states_paths_l,
             E_paths_from_parent=E_paths_from_parent_l,
         )
+
         if l < len(levels):
             levels[l] = level_l
         else:
@@ -693,8 +690,8 @@ def build_lorenz_hierarchy_from_params(
         levels=levels,
         states_grids=states_grids,
         T0=T0,
-        T1=T0 // K0,
-        T2=(T0 // K0) // K1,
+        T1=T1,
+        T2=T2,
         K0=K0,
         K1=K1,
         H_blocks=H0,
