@@ -41,9 +41,6 @@ from .lorenz_inference import (
     infer_lorenz_hierarchy,
 )
 
-# Global debug flag for this module
-DEBUG_LEARNING = False
-
 # -----------------------------------------------------------------------------
 # 1. Sufficient statistics for lowest level (A0, E_states^0, preferences)
 # -----------------------------------------------------------------------------
@@ -162,7 +159,7 @@ def accumulate_B_states_paths_counts_level(
 
     for t in range(T - 1):
         qs_t = qs_flat[t]      # (N_sites, S)
-        qs_tp1 = qs_flat[t + 1]  # (N_sites, S)
+        qs_tp1 = qs_flat[t+1]  # (N_sites, S)
 
         base_t = qs_t.T @ qs_tp1  # (S, S)
 
@@ -240,9 +237,17 @@ def update_dirichlet_from_sequence(
     qs_levels = results["qs_levels"]
     qu_levels = results["qu_levels"]
 
+    num_levels = len(qs_levels)
+
     qs0_grid = qs_levels[0]
-    qs1_grid = qs_levels[1] if len(qs_levels) > 1 and qs_levels[1] is not None else None
-    qs2_grid = qs_levels[2] if len(qs_levels) > 2 and qs_levels[2] is not None else None
+    qs_higher: List[Optional[jnp.ndarray]] = [qs_levels[l] for l in range(1, num_levels)]
+    # Path posterior lives at the highest path-carrying level; find its index
+    top_idx = None
+    for idx in reversed(range(len(qu_levels))):
+        if qu_levels[idx] is not None:
+            top_idx = idx
+            break
+    qu_top = qu_levels[top_idx] if top_idx is not None else None
 
     # 3. Level 0 counts
     dA0 = accumulate_A_counts_level0(qs0_grid, obs_grid)
@@ -253,64 +258,44 @@ def update_dirichlet_from_sequence(
     params.E_states_alpha[0] = params.E_states_alpha[0] + dE0
     params.pref_alpha = params.pref_alpha + dC0
 
-    # 4. Higher-level state priors (E_states) if present
-    if qs1_grid is not None and len(params.E_states_alpha) > 1:
-        dE1 = accumulate_E_states_counts_level(qs1_grid)
-        params.E_states_alpha[1] = params.E_states_alpha[1] + dE1
-
-    if qs2_grid is not None and len(params.E_states_alpha) > 2:
-        dE2 = accumulate_E_states_counts_level(qs2_grid)
-        params.E_states_alpha[2] = params.E_states_alpha[2] + dE2
+    # 4. Higher-level state priors (E_states) for all levels l >= 1
+    for l in range(1, num_levels):
+        qs_l = qs_levels[l]
+        if qs_l is not None and l < len(params.E_states_alpha):
+            dE_l = accumulate_E_states_counts_level(qs_l)
+            params.E_states_alpha[l] = params.E_states_alpha[l] + dE_l
 
     # 5. Path counts at the highest path-carrying level (top_idx)
-    #    We detect top_idx in the same way as in inference: highest level
-    #    with both C_paths_alpha and E_paths_alpha defined.
-    top_idx = None
-    for idx in reversed(range(len(params.C_paths_alpha))):
-        if (
-            params.C_paths_alpha[idx] is not None
-            and params.E_paths_alpha[idx] is not None
-        ):
-            top_idx = idx
-            break
+    if qu_top is not None:
+        # Find highest level with path factor, consistent with params
+        path_level_idx = None
+        for idx in reversed(range(len(params.C_paths_alpha))):
+            if (
+                params.C_paths_alpha[idx] is not None
+                and params.E_paths_alpha[idx] is not None
+            ):
+                path_level_idx = idx
+                break
 
-    if top_idx is not None:
-        qu_top = qu_levels[top_idx]
-        if qu_top is not None:
-            # Update C_paths_alpha and E_paths_alpha
+        if path_level_idx is not None:
             dC_paths, dE_paths = accumulate_C_E_paths(qu_top)
-            params.C_paths_alpha[top_idx] = params.C_paths_alpha[top_idx] + dC_paths
-            params.E_paths_alpha[top_idx] = params.E_paths_alpha[top_idx] + dE_paths
+            params.C_paths_alpha[path_level_idx] = (
+                params.C_paths_alpha[path_level_idx] + dC_paths
+            )
+            params.E_paths_alpha[path_level_idx] = (
+                params.E_paths_alpha[path_level_idx] + dE_paths
+            )
 
             # 6. Path-dependent state transitions at that same level
-            if params.B_states_paths_alpha[top_idx] is not None:
-                qs_top_grid = None
-                if top_idx == 2 and qs2_grid is not None:
-                    qs_top_grid = qs2_grid
-                elif top_idx == 1 and qs1_grid is not None:
-                    qs_top_grid = qs1_grid
-                elif top_idx == 0:
-                    qs_top_grid = qs0_grid
-
+            if params.B_states_paths_alpha[path_level_idx] is not None:
+                qs_top_grid = qs_levels[path_level_idx]
                 if qs_top_grid is not None:
                     dB_states_paths = accumulate_B_states_paths_counts_level(
                         qs_top_grid, qu_top
                     )
-                    params.B_states_paths_alpha[top_idx] = (
-                        params.B_states_paths_alpha[top_idx] + dB_states_paths
+                    params.B_states_paths_alpha[path_level_idx] = (
+                        params.B_states_paths_alpha[path_level_idx] + dB_states_paths
                     )
-
-                    if DEBUG_LEARNING:
-                        # Simple diagnostic: Frobenius norm between kernels
-                        B_alpha = params.B_states_paths_alpha[top_idx]
-                        # Convert to probabilities over s_next (axis=0) for each (s,u)
-                        B_prob = B_alpha / (B_alpha.sum(axis=0, keepdims=True) + 1e-8)
-                        if B_prob.shape[2] >= 2:
-                            diff = jnp.linalg.norm(B_prob[:, :, 0] - B_prob[:, :, 1])
-                            print(
-                                f"[update_dirichlet_from_sequence] "
-                                f"top_idx={top_idx}, ||B[:,:,0]-B[:,:,1]||_F={float(diff):.4f}"
-                            )
 
     return params
 
@@ -346,7 +331,7 @@ def train_lorenz_rgm(
       initial_params: initial Dirichlet parameters
       lorenz_spatial_hierarchy: spatial hierarchy (states_grids, D tensors)
       build_data_fn: callable returning a lorenz_data_dict
-      K, L: lowest-level configuration
+      K, L: lowest-level configuration (unused here but kept for API symmetry)
       T0, K0, K1: temporal structure
       num_epochs: number of epochs
       num_sequences_per_epoch: sequences per epoch
