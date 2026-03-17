@@ -613,37 +613,24 @@ def infer_lorenz_hierarchy(
     if num_levels == 1:
         return {"qs_levels": qs_levels, "qu_levels": qu_levels}
 
-    # 2. Level-1 and (optionally) level-2 states
+    # 2. Higher levels (generalized): build qs_l grids for all l >= 1
+    states_grids = hierarchy.states_grids
+    qs_current: List[Optional[jnp.ndarray]] = [None] * num_levels
 
-    # Level 1
-    level1: LorenzLevel = hierarchy.levels[1]
-    states_grid1 = hierarchy.states_grids[1]
+    # Level 0 is already inferred
+    qs_current[0] = qs0_grid
 
-    # Initialize q(s^1)
-    T1, H1, W1 = states_grid1.shape
-    assert T1 == T0
-    qs1_grid = jnp.full(
-        (T0, H1, W1, level1.S),
-        1.0 / level1.S,
-        dtype=jnp.float32,
-    )
-
-    # Level 2 if present
-    has_level2 = num_levels > 2
-    if has_level2:
-        level2: LorenzLevel = hierarchy.levels[2]
-        states_grid2 = hierarchy.states_grids[2]
-        T2, H2, W2 = states_grid2.shape
-        assert T2 == T0
-        qs2_grid = jnp.full(
-            (T0, H2, W2, level2.S),
-            1.0 / level2.S,
+    for l in range(1, num_levels):
+        level_l = hierarchy.levels[l]
+        states_grid_l = states_grids[l]
+        Tl, Hl, Wl = states_grid_l.shape
+        assert Tl == T0
+        qs_l = jnp.full(
+            (T0, Hl, Wl, level_l.S),
+            1.0 / level_l.S,
             dtype=jnp.float32,
         )
-    else:
-        level2 = None
-        states_grid2 = None
-        qs2_grid = None
+        qs_current[l] = qs_l
 
     # Determine top level carrying paths (by level index)
     top_idx = None
@@ -669,57 +656,52 @@ def infer_lorenz_hierarchy(
         level_top = None
         qu_top = None
 
-    # Hierarchical inference: alternate block updates:
-    # 0 <-> 1 (without paths)
-    # 1 <-> 2 (with paths if level 2 is top)
-
-    qs0_current = qs0_grid
-    qs1_current = qs1_grid
-    qs2_current = qs2_grid
+    # Hierarchical inference: alternate bottom-up / top-down across all levels
     qu_top_current = qu_top
 
     for _ in range(num_iter_hier):
-        # 0 <-> 1 (no explicit paths at level 1 in this configuration)
-        qs0_current, qs1_current = vmp_two_level_states(
-            level_child=level0,
-            level_parent=level1,
-            qs_child_grid=qs0_current,
-            states_grid_parent=states_grid1,
-            qu_parent=None,
-            num_iter=1,
-        )
+        # Upward passes: 0 <-> 1, 1 <-> 2, ..., (L-2) <-> (L-1)
+        for l_child in range(num_levels - 1):
+            l_parent = l_child + 1
+            level_child = hierarchy.levels[l_child]
+            level_parent = hierarchy.levels[l_parent]
 
-        # 1 <-> 2 if level 2 exists
-        if has_level2:
-            # paths at level 2 if top_idx == 2
-            qu_for_level2 = qu_top_current if (paths_active and top_idx == 2) else None
-            qs1_current, qs2_current = vmp_two_level_states(
-                level_child=level1,
-                level_parent=level2,
-                qs_child_grid=qs1_current,
-                states_grid_parent=states_grid2,
-                qu_parent=qu_for_level2,
+            qs_child = qs_current[l_child]
+            qs_parent = qs_current[l_parent]
+            states_grid_parent = states_grids[l_parent]
+
+            # Only run coupled block if this parent has a D_state_from_parent
+            if level_parent.D_state_from_parent is None:
+                continue
+
+            # Path posterior only at the top path level
+            qu_parent = None
+            if paths_active and (l_parent == top_idx):
+                qu_parent = qu_top_current
+
+            qs_child_new, qs_parent_new = vmp_two_level_states(
+                level_child=level_child,
+                level_parent=level_parent,
+                qs_child_grid=qs_child,
+                states_grid_parent=states_grid_parent,
+                qu_parent=qu_parent,
                 num_iter=1,
             )
+
+            qs_current[l_child] = qs_child_new
+            qs_current[l_parent] = qs_parent_new
 
         # Path update if active
         if paths_active:
             # top-level state grid for EFE is from the level that carries paths
-            if top_idx == 2:
-                qs_top_grid = qs2_current
-            elif top_idx == 1:
-                qs_top_grid = qs1_current
-            else:
-                qs_top_grid = qs0_current  # (not expected in current config)
-
+            qs_top_grid = qs_current[top_idx]
             level0_for_efe = level0
-            # Note: in this implementation, G_tu is treated as time-constant
-            # (computed from the current posteriors and broadcast over t).
+
             G_tu = compute_expected_free_energy_paths(
                 level_top=level_top,
                 level0=level0_for_efe,
                 qs_top_grid=qs_top_grid,
-                qs0_grid=qs0_current,
+                qs0_grid=qs_current[0],
                 C=C,
                 tau=2,
             )
@@ -737,11 +719,8 @@ def infer_lorenz_hierarchy(
                 print(f"[infer_lorenz_hierarchy] qu_top mean={qu_mean}, std={qu_std}")
 
     # Collect results per level
-    qs_levels[0] = qs0_current
-    if num_levels > 1:
-        qs_levels[1] = qs1_current
-    if num_levels > 2:
-        qs_levels[2] = qs2_current
+    for l in range(num_levels):
+        qs_levels[l] = qs_current[l]
 
     if paths_active and qu_top_current is not None:
         qu_levels[top_idx] = qu_top_current
