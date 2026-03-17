@@ -6,9 +6,9 @@ This module implements:
 - Accumulation of Dirichlet counts for A, E_states, and preferences from
   posterior beliefs over states and observations.
 - Updates of Dirichlet concentration parameters stored in LorenzRGMParams:
-    * A_alpha[l], E_states_alpha[l], pref_alpha
-    * D_state_from_parent_alpha[l] (if desired),
-    * (optionally) B_states_paths_alpha[l], C_paths_alpha[l], E_paths_alpha[l]
+  * A_alpha[l], E_states_alpha[l], pref_alpha
+  * D_state_from_parent_alpha[l] (if desired),
+  * (optionally) B_states_paths_alpha[l], C_paths_alpha[l], E_paths_alpha[l]
 - A training loop scaffold that alternates between inference and parameter
   updates over one or more Lorenz trajectories.
 
@@ -40,6 +40,9 @@ from .lorenz_inference import (
     build_lowest_level_observations_grid,
     infer_lorenz_hierarchy,
 )
+
+# Global debug flag for this module
+DEBUG_LEARNING = False
 
 # -----------------------------------------------------------------------------
 # 1. Sufficient statistics for lowest level (A0, E_states^0, preferences)
@@ -139,7 +142,7 @@ def accumulate_B_states_paths_counts_level(
 
     Approximation:
       dB_states_paths[s, s', u]
-        ≈ sum_t q(u_t = u) * sum_{h,w} q(s_t = s) q(s_{t+1} = s').
+      ≈ sum_t q(u_t = u) * sum_{h,w} q(s_t = s) q(s_{t+1} = s').
 
     Args:
       qs_grid: (T, H, W, S)
@@ -158,7 +161,7 @@ def accumulate_B_states_paths_counts_level(
     dB_states_paths = jnp.zeros((S, S, U), dtype=jnp.float32)
 
     for t in range(T - 1):
-        qs_t = qs_flat[t]        # (N_sites, S)
+        qs_t = qs_flat[t]      # (N_sites, S)
         qs_tp1 = qs_flat[t + 1]  # (N_sites, S)
 
         base_t = qs_t.T @ qs_tp1  # (S, S)
@@ -238,9 +241,8 @@ def update_dirichlet_from_sequence(
     qu_levels = results["qu_levels"]
 
     qs0_grid = qs_levels[0]
-    qs1_grid = qs_levels[1] if len(qs_levels) > 1 else None
-    qs2_grid = qs_levels[2] if len(qs_levels) > 2 else None
-    qu_top = qu_levels[-1] if len(qu_levels) > 1 else None
+    qs1_grid = qs_levels[1] if len(qs_levels) > 1 and qs_levels[1] is not None else None
+    qs2_grid = qs_levels[2] if len(qs_levels) > 2 and qs_levels[2] is not None else None
 
     # 3. Level 0 counts
     dA0 = accumulate_A_counts_level0(qs0_grid, obs_grid)
@@ -261,26 +263,27 @@ def update_dirichlet_from_sequence(
         params.E_states_alpha[2] = params.E_states_alpha[2] + dE2
 
     # 5. Path counts at the highest path-carrying level (top_idx)
-    if qu_top is not None:
-        # Find highest level with path factor, consistent with inference
-        top_idx = None
-        for idx in reversed(range(len(params.C_paths_alpha))):
-            if (
-                params.C_paths_alpha[idx] is not None
-                and params.E_paths_alpha[idx] is not None
-            ):
-                top_idx = idx
-                break
+    #    We detect top_idx in the same way as in inference: highest level
+    #    with both C_paths_alpha and E_paths_alpha defined.
+    top_idx = None
+    for idx in reversed(range(len(params.C_paths_alpha))):
+        if (
+            params.C_paths_alpha[idx] is not None
+            and params.E_paths_alpha[idx] is not None
+        ):
+            top_idx = idx
+            break
 
-        if top_idx is not None:
+    if top_idx is not None:
+        qu_top = qu_levels[top_idx]
+        if qu_top is not None:
+            # Update C_paths_alpha and E_paths_alpha
             dC_paths, dE_paths = accumulate_C_E_paths(qu_top)
             params.C_paths_alpha[top_idx] = params.C_paths_alpha[top_idx] + dC_paths
             params.E_paths_alpha[top_idx] = params.E_paths_alpha[top_idx] + dE_paths
 
             # 6. Path-dependent state transitions at that same level
-            if (
-                params.B_states_paths_alpha[top_idx] is not None
-            ):
+            if params.B_states_paths_alpha[top_idx] is not None:
                 qs_top_grid = None
                 if top_idx == 2 and qs2_grid is not None:
                     qs_top_grid = qs2_grid
@@ -296,6 +299,18 @@ def update_dirichlet_from_sequence(
                     params.B_states_paths_alpha[top_idx] = (
                         params.B_states_paths_alpha[top_idx] + dB_states_paths
                     )
+
+                    if DEBUG_LEARNING:
+                        # Simple diagnostic: Frobenius norm between kernels
+                        B_alpha = params.B_states_paths_alpha[top_idx]
+                        # Convert to probabilities over s_next (axis=0) for each (s,u)
+                        B_prob = B_alpha / (B_alpha.sum(axis=0, keepdims=True) + 1e-8)
+                        if B_prob.shape[2] >= 2:
+                            diff = jnp.linalg.norm(B_prob[:, :, 0] - B_prob[:, :, 1])
+                            print(
+                                f"[update_dirichlet_from_sequence] "
+                                f"top_idx={top_idx}, ||B[:,:,0]-B[:,:,1]||_F={float(diff):.4f}"
+                            )
 
     return params
 
