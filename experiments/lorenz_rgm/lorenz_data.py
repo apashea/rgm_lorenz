@@ -29,6 +29,9 @@ import numpy as np
 import jax.numpy as jnp
 from scipy.integrate import solve_ivp
 
+# Global debug flag
+DEBUG_DATA = False
+
 # -----------------------------------------------------------------------------
 # 1. Lorenz simulation
 # -----------------------------------------------------------------------------
@@ -46,9 +49,9 @@ def simulate_lorenz(
     """
     Simulate the Lorenz system for T steps with step size dt.
 
-    dx/dt = sigma * (y - x)
-    dy/dt = x * (rho - z) - y
-    dz/dt = x * y - beta * z
+      dx/dt = sigma * (y - x)
+      dy/dt = x * (rho - z) - y
+      dz/dt = x * y - beta * z
 
     Args:
       T: number of time steps (this is T0 at the lowest RGM level)
@@ -68,11 +71,16 @@ def simulate_lorenz(
 
     t_span = (0.0, (T - 1) * dt)
     t_eval = np.linspace(t_span[0], t_span[1], T)
-    sol = solve_ivp(lorenz_rhs, t_span, [x0, y0, z0], t_eval=t_eval,
-                    rtol=1e-6, atol=1e-9)
+    sol = solve_ivp(
+        lorenz_rhs,
+        t_span,
+        [x0, y0, z0],
+        t_eval=t_eval,
+        rtol=1e-6,
+        atol=1e-9,
+    )
     traj = sol.y.T  # (T, 3)
     return traj
-
 
 # -----------------------------------------------------------------------------
 # 2. Rendering Lorenz trajectory to images
@@ -132,7 +140,6 @@ def render_lorenz_to_images(
                     images[t, jy, jx] = 1.0
 
     return images
-
 
 # -----------------------------------------------------------------------------
 # 3. Patch extraction and SVD over patches
@@ -203,7 +210,6 @@ def compute_svd_basis_over_patches(
     Vt = Vt_full[:K, :]
     return U, S, Vt
 
-
 # -----------------------------------------------------------------------------
 # 4. Quantize SVD coefficients into discrete bins
 # -----------------------------------------------------------------------------
@@ -267,9 +273,8 @@ def encode_mixed_radix_states(
     """
     N, K = q_coeffs.shape
     bases = (L ** np.arange(K, dtype=np.int64)).reshape(1, K)  # (1, K)
-    states = (q_coeffs.astype(np.int64) * bases).sum(axis=1)   # (N,)
+    states = (q_coeffs.astype(np.int64) * bases).sum(axis=1)  # (N,)
     return states
-
 
 # -----------------------------------------------------------------------------
 # 5. High-level data builder for Lorenz RGM
@@ -313,7 +318,7 @@ def build_lorenz_patch_dataset(
         - 'patches': (N, P) flattened patches
         - 'q_coeffs': (N, K) quantized coefficient indices
         - 'states': (N,) integer discrete states per patch
-        - 'T': T  (interpreted as T0 in RGM)
+        - 'T': T (interpreted as T0 in RGM)
         - 'dt': dt
         - 'img_size': img_size
         - 'patch_size': patch_size
@@ -363,5 +368,12 @@ def build_lorenz_patch_dataset(
         "bin_edges": bin_edges,
         "bin_centers": bin_centers,
     }
+
+    if DEBUG_DATA:
+        print("[build_lorenz_patch_dataset] Summary:")
+        print("  T =", T, "img_size =", img_size, "patch_size =", patch_size)
+        print("  H_blocks =", H_blocks, "W_blocks =", W_blocks, "K =", K, "L =", L)
+        print("  states range:", int(states.min()), "to", int(states.max()))
+        print("  q_coeffs[0:3] =", q_coeffs[:3])
 
     return lorenz_data_dict
