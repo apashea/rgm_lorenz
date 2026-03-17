@@ -4,10 +4,10 @@ Numerical and tensor utilities for the Lorenz RGM example.
 
 This module adapts the most relevant parts of pymdp.jax.maths for our
 RGM/Lorenz setting:
-  - stable entropy / cross-entropy / log
-  - factorized tensor contractions (via opt_einsum)
-  - log-likelihood and free energy for simple discrete models
-  - Dirichlet expectation utilities
+- stable entropy / cross-entropy / log
+- factorized tensor contractions (via opt_einsum)
+- log-likelihood and free energy for simple discrete models
+- Dirichlet expectation utilities
 
 It is intentionally lightweight and can later be extended or replaced
 by a more general RGM maths module.
@@ -23,7 +23,6 @@ from jax.scipy.special import xlogy
 from opt_einsum import contract
 
 MINVAL = jnp.finfo(float).eps
-
 
 # -----------------------------------------------------------------------------
 # 1. Stable scalar functions
@@ -55,7 +54,6 @@ def log_stable(x: jnp.ndarray) -> jnp.ndarray:
     Log with lower bound to avoid -inf.
     """
     return jnp.log(jnp.clip(x, a_min=MINVAL))
-
 
 # -----------------------------------------------------------------------------
 # 2. Factorized tensor contractions
@@ -116,7 +114,6 @@ def factor_dot_flex(
     args += [keep_dims]
     return contract(*args, backend='jax')
 
-
 # -----------------------------------------------------------------------------
 # 3. Likelihoods and free energy (simple discrete case)
 # -----------------------------------------------------------------------------
@@ -166,13 +163,14 @@ def compute_log_likelihood(
     obs: list of modality observations
     A: list of modality-specific likelihood arrays
     Returns:
-        ll: (S,) log-likelihood over hidden states
+      ll: (S,) log-likelihood over hidden states
     """
     result = tree_util.tree_map(
         lambda o, a: compute_log_likelihood_single_modality(o, a, distr_obs=distr_obs),
         obs,
         A
     )
+
     ll = jnp.sum(jnp.stack(result, axis=0), axis=0)
     return ll
 
@@ -215,7 +213,6 @@ def compute_free_energy(
 
     vfe -= compute_accuracy(qs, obs, A)
     return vfe
-
 
 # -----------------------------------------------------------------------------
 # 4. Dirichlet utilities
