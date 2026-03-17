@@ -36,9 +36,6 @@ import jax.numpy as jnp
 
 from .lorenz_model import LorenzLevel
 
-# Global debug flag
-DEBUG_EFE = False
-
 # -----------------------------------------------------------------------------
 # 1. Predictive rollouts under path-dependent dynamics
 # -----------------------------------------------------------------------------
@@ -69,17 +66,17 @@ def rollout_predictive_states_under_path_tau(
       using the mean over spatial sites.
 
     Args:
-      qs0_grid: (T, H0, W0, S0) posterior over level-0 states
-      qs_top_grid: (T, H_top, W_top, S_top) posterior over top-level states
-      level_top: top-level LorenzLevel (with B_states_paths)
-      level0: lowest-level LorenzLevel (with A)
-      u_idx: index of the path u ∈ {0,...,U-1}
-      tau: planning horizon
+        qs0_grid: (T, H0, W0, S0) posterior over level-0 states
+        qs_top_grid: (T, H_top, W_top, S_top) posterior over top-level states
+        level_top: top-level LorenzLevel (with B_states_paths)
+        level0: lowest-level LorenzLevel (with A)
+        u_idx: index of the path u ∈ {0,...,U-1}
+        tau: planning horizon
 
     Returns:
-      qs0_pred_u: (tau, S0) predictive distributions over level-0 states
-      qs_top_pred_u: (tau, S_top) predictive distributions over top-level states
-      qo_pred_u: (tau, O0) predictive observations at lowest level
+        qs0_pred_u: (tau, S0) predictive distributions over level-0 states
+        qs_top_pred_u: (tau, S_top) predictive distributions over top-level states
+        qo_pred_u: (tau, O0) predictive observations at lowest level
     """
     # Lowest level emission
     A0 = level0.A  # (S0, O0)
@@ -96,7 +93,7 @@ def rollout_predictive_states_under_path_tau(
         )
 
     # Start from last posterior time point
-    qs0_last = qs0_grid[-1]      # (H0, W0, S0)
+    qs0_last = qs0_grid[-1]  # (H0, W0, S0)
     qs_top_last = qs_top_grid[-1]  # (H_top, W_top, S_top)
 
     # Aggregate over space to get global marginals
@@ -147,6 +144,7 @@ def rollout_predictive_states_under_path_tau(
     # qs0_seq: (tau, S0), qs_top_seq: (tau, S_top), qo_seq: (tau, O0)
     return qs0_seq, qs_top_seq, qo_seq
 
+
 # -----------------------------------------------------------------------------
 # 2. Risk, ambiguity, epistemic terms
 # -----------------------------------------------------------------------------
@@ -161,14 +159,14 @@ def compute_risk_term(
 
     Risk is approximated as expected negative log preference:
 
-      risk_k ≈ E_{q(o_{t+k}|u)}[ -log C(o_{t+k}) ]
+        risk_k ≈ E_{q(o_{t+k}|u)}[ -log C(o_{t+k}) ]
 
     Args:
-      qo_pred: (tau, O0) predictive observation distributions
-      C: (O0,) preference distribution
+        qo_pred: (tau, O0) predictive observation distributions
+        C: (O0,) preference distribution
 
     Returns:
-      risk: (tau,) risk per horizon step
+        risk: (tau,) risk per horizon step
     """
     eps = 1e-16
     log_C = jnp.log(jnp.clip(C, eps, 1.0))  # (O0,)
@@ -186,14 +184,14 @@ def compute_ambiguity_term(
 
     Ambiguity is approximated as expected conditional entropy H[o|s]:
 
-      ambiguity_k ≈ E_{q(s_{t+k}|u)}[ H[p(o|s_{t+k})] ]
+        ambiguity_k ≈ E_{q(s_{t+k}|u)}[ H[p(o|s_{t+k})] ]
 
     Args:
-      qs0_pred: (tau, S0) predictive states at lowest level
-      level0: LorenzLevel with A
+        qs0_pred: (tau, S0) predictive states at lowest level
+        level0: LorenzLevel with A
 
     Returns:
-      ambiguity: (tau,) ambiguity per horizon step
+        ambiguity: (tau,) ambiguity per horizon step
     """
     A0 = level0.A  # (S0, O0)
     eps = 1e-16
@@ -221,21 +219,22 @@ def compute_epistemic_term_from_qs_top_pred(
     We approximate epistemic value as the negative entropy of
     the predictive state distribution:
 
-      epistemic_k ≈ -H[q(s^top_{t+k}|u)]
+        epistemic_k ≈ -H[q(s^top_{t+k}|u)]
 
     so that higher state uncertainty yields lower epistemic "value".
 
     Args:
-      qs_top_pred: (tau, S_top) predictive top-level states
+        qs_top_pred: (tau, S_top) predictive top-level states
 
     Returns:
-      epistemic: (tau,) epistemic term per horizon step
+        epistemic: (tau,) epistemic term per horizon step
     """
     eps = 1e-16
     log_q = jnp.log(jnp.clip(qs_top_pred, eps, 1.0))
     entropy = -jnp.sum(qs_top_pred * log_q, axis=1)  # (tau,)
     epistemic = -entropy
     return epistemic
+
 
 # -----------------------------------------------------------------------------
 # 3. Expected free energy over paths
@@ -256,8 +255,8 @@ def compute_expected_free_energy_paths(
 
     In this implementation, we approximate G(t, u) by:
 
-      G(t, u) ≈ sum_{k=1..tau} [ risk_{t+k|u} + ambiguity_{t+k|u}
-                                  - epistemic_{t+k|u} ]
+        G(t, u) ≈ sum_{k=1..tau} [ risk_{t+k|u} + ambiguity_{t+k|u}
+                                    - epistemic_{t+k|u} ]
 
     where predictive distributions q(s, o | u) over the horizon are
     generated by rolling forward under B_states_paths[:,:,u].
@@ -268,15 +267,15 @@ def compute_expected_free_energy_paths(
     - Treat this G(t, u) as time-constant across t (broadcast).
 
     Args:
-      level_top: top-level LorenzLevel (with num_paths > 0 and B_states_paths)
-      level0: lowest-level LorenzLevel (with A)
-      qs_top_grid: (T, H_top, W_top, S_top) top-level posteriors (data)
-      qs0_grid: (T, H0, W0, S0) lowest-level posteriors (data)
-      C: (O0,) preference distribution over lowest-level outcomes
-      tau: integer planning horizon (number of predictive steps)
+        level_top: top-level LorenzLevel (with num_paths > 0 and B_states_paths)
+        level0: lowest-level LorenzLevel (with A)
+        qs_top_grid: (T, H_top, W_top, S_top) top-level posteriors (data)
+        qs0_grid: (T, H0, W0, S0) lowest-level posteriors (data)
+        C: (O0,) preference distribution over lowest-level outcomes
+        tau: integer planning horizon (number of predictive steps)
 
     Returns:
-      G_tu: (T, U) expected free energy per time and path
+        G_tu: (T, U) expected free energy per time and path
     """
     U = level_top.num_paths
     if U == 0:
@@ -302,9 +301,6 @@ def compute_expected_free_energy_paths(
         epistemic = compute_epistemic_term_from_qs_top_pred(qs_top_mean)  # (T,)
 
         G_t = risk + ambiguity - epistemic
-        if DEBUG_EFE:
-            print("[compute_expected_free_energy_paths] Fallback branch, scalar G_t summary:")
-            print("  mean(G_t) =", float(G_t.mean()), "std(G_t) =", float(G_t.std()))
         return jnp.broadcast_to(G_t[:, None], (T, U))
 
     # Path-specific G_u via tau-step rollout
@@ -326,22 +322,14 @@ def compute_expected_free_energy_paths(
 
         G_seq = risk_u + ambiguity_u - epistemic_u  # (tau,)
         G_u = G_seq.sum()
-        if DEBUG_EFE:
-            print(f"[compute_expected_free_energy_paths] u={int(u_idx)}:")
-            print("  risk mean/std:", float(risk_u.mean()), float(risk_u.std()))
-            print("  ambiguity mean/std:", float(ambiguity_u.mean()), float(ambiguity_u.std()))
-            print("  epistemic mean/std:", float(epistemic_u.mean()), float(epistemic_u.std()))
-            print("  G_u =", float(G_u))
         return G_u
 
     G_u_vec = jax.vmap(G_for_path)(jnp.arange(U))  # (U,)
 
-    if DEBUG_EFE:
-        print("[compute_expected_free_energy_paths] G_u_vec =", np.array(G_u_vec))
-
     # Broadcast the same G_u over all current times t in this simple implementation.
     G_tu = jnp.broadcast_to(G_u_vec[None, :], (T, U))  # (T, U)
     return G_tu
+
 
 # -----------------------------------------------------------------------------
 # 4. Path posterior update given G_tu and path dynamics
@@ -357,18 +345,18 @@ def update_path_posterior_from_G(
     Update the path posterior q(u_t) using G_tu and the path transition
     model at the top level:
 
-      p(u_t | G) ∝ exp(-gamma * G_tu)
+        p(u_t | G) ∝ exp(-gamma * G_tu)
 
     Then perform VMP over the path chain using C_paths and E_paths.
 
     Args:
-      level_top: top-level LorenzLevel with C_paths, E_paths, num_paths > 0
-      G_tu: (T, U) expected free energy per time and path
-      gamma: precision over expected free energy
-      num_iter: number of VMP iterations over the path chain
+        level_top: top-level LorenzLevel with C_paths, E_paths, num_paths > 0
+        G_tu: (T, U) expected free energy per time and path
+        gamma: precision over expected free energy
+        num_iter: number of VMP iterations over the path chain
 
     Returns:
-      qu_t: (T, U) posterior over paths at each time
+        qu_t: (T, U) posterior over paths at each time
     """
     U = level_top.num_paths
     if U == 0:
@@ -429,11 +417,4 @@ def update_path_posterior_from_G(
         return update_once(qu_)
 
     qu_final = jax.lax.fori_loop(0, num_iter, body_fun, qu)
-
-    if DEBUG_EFE:
-        qu_mean = jnp.mean(qu_final, axis=0)
-        qu_std = jnp.std(qu_final, axis=0)
-        print("[update_path_posterior_from_G] qu mean:", np.array(qu_mean))
-        print("[update_path_posterior_from_G] qu std:", np.array(qu_std))
-
     return qu_final
