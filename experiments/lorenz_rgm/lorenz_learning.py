@@ -9,14 +9,15 @@ This module implements:
   C_alpha) stored in LorenzRGMParams.
 - Accumulation and updates for path-related Dirichlet parameters:
   * B_states_paths_alpha: path-dependent state transitions at top level
-  * B_paths_alpha: path transition dynamics at top level
-  * E_paths_alpha: initial path priors at top level
+  * B_paths_alpha: path transition dynamics
+  * E_paths_alpha: initial path priors
 - A training loop scaffold that alternates between inference and parameter
   updates over one or more Lorenz trajectories.
 
-The model structure (levels, D matrices, path factors) is defined in
-lorenz_model.py. Inference over states and paths is provided by
-lorenz_inference.py.
+It assumes:
+- The generative model structure (levels, D matrices, path factors)
+  is defined in lorenz_model.py.
+- Inference over states and paths is provided by lorenz_inference.py.
 """
 
 from typing import Dict, Any, List, Tuple, Optional
@@ -35,7 +36,6 @@ from .lorenz_inference import (
     infer_lorenz_hierarchy,
 )
 
-
 # -----------------------------------------------------------------------------
 # 1. Sufficient statistics for lowest level (A0, B0, E0, C0)
 # -----------------------------------------------------------------------------
@@ -48,63 +48,63 @@ def accumulate_A_counts_level0(
     Accumulate expected counts for A0 (lowest-level emission matrix).
 
     Args:
-        qs0_grid: (T, H0, W0, S0) posterior over lowest-level states
-        obs_grid: (T, H0, W0, O0) outcomes (one-hot or distributions)
+        qs0_grid: (T, H0, W0, S0)
+        obs_grid: (T, H0, W0, O0)
 
     Returns:
-        dA0: (S0, O0) Dirichlet count increments for A0
+        dA0: (S0, O0)
     """
     T, H0, W0, S0 = qs0_grid.shape
     _, _, _, O0 = obs_grid.shape
 
-    qs_flat = qs0_grid.reshape(T * H0 * W0, S0)   # (N, S0)
-    obs_flat = obs_grid.reshape(T * H0 * W0, O0)  # (N, O0)
+    qs_flat = qs0_grid.reshape(T * H0 * W0, S0)
+    obs_flat = obs_grid.reshape(T * H0 * W0, O0)
 
-    dA0 = qs_flat.T @ obs_flat  # (S0, O0)
+    dA0 = qs_flat.T @ obs_flat
     return dA0
 
 
-def accumulate_B_counts_level(
-    qs_grid: jnp.ndarray,
+def accumulate_B_counts_level0(
+    qs0_grid: jnp.ndarray,
 ) -> jnp.ndarray:
     """
-    Accumulate expected counts for B at a single level.
+    Accumulate expected counts for B0 (lowest-level transitions).
 
     Approximation:
-        dB[s, s_next] = sum_{t,sites} q(s_t = s) * q(s_{t+1} = s_next)
+        dB[s, s'] = sum_{t,h,w} q(s_t = s) * q(s_{t+1} = s').
 
     Args:
-        qs_grid: (T, H, W, S)
+        qs0_grid: (T, H0, W0, S0)
 
     Returns:
-        dB: (S, S) Dirichlet count increments for B at this level
+        dB0: (S0, S0)
     """
-    T, H, W, S = qs_grid.shape
+    T, H0, W0, S0 = qs0_grid.shape
 
-    qt = qs_grid[:-1].reshape((T - 1) * H * W, S)   # (N_tr, S)
-    qt1 = qs_grid[1:].reshape((T - 1) * H * W, S)   # (N_tr, S)
+    qt = qs0_grid[:-1].reshape((T - 1) * H0 * W0, S0)
+    qt1 = qs0_grid[1:].reshape((T - 1) * H0 * W0, S0)
 
-    dB = qt.T @ qt1  # (S, S)
-    return dB
+    dB0 = qt.T @ qt1
+    return dB0
 
 
-def accumulate_E_counts_level(
-    qs_grid: jnp.ndarray,
+def accumulate_E_counts_level0(
+    qs0_grid: jnp.ndarray,
 ) -> jnp.ndarray:
     """
-    Accumulate expected counts for E (prior over initial states) at a level.
+    Accumulate expected counts for E0 (prior over initial states).
 
     Args:
-        qs_grid: (T, H, W, S)
+        qs0_grid: (T, H0, W0, S0)
 
     Returns:
-        dE: (S,) Dirichlet count increments for E
+        dE0: (S0,)
     """
-    q0 = qs_grid[0]  # (H, W, S)
-    H, W, S = q0.shape
-    q0_flat = q0.reshape(H * W, S)
-    dE = q0_flat.sum(axis=0)  # (S,)
-    return dE
+    q0 = qs0_grid[0]  # (H0, W0, S0)
+    H0, W0, S0 = q0.shape
+    q0_flat = q0.reshape(H0 * W0, S0)
+    dE0 = q0_flat.sum(axis=0)
+    return dE0
 
 
 def accumulate_C_counts(
@@ -117,195 +117,338 @@ def accumulate_C_counts(
         obs_grid: (T, H0, W0, O0)
 
     Returns:
-        dC0: (O0,) Dirichlet count increments for C0
+        dC0: (O0,)
     """
-    dC0 = obs_grid.sum(axis=(0, 1, 2))  # (O0,)
+    dC0 = obs_grid.sum(axis=(0, 1, 2))
     return dC0
 
 
 # -----------------------------------------------------------------------------
-# 2. Sufficient statistics for path-dependent transitions and paths (top level)
+# 2. Sufficient statistics for higher level (B1, E1)
 # -----------------------------------------------------------------------------
 
-def accumulate_B_states_paths_counts_top(
-    qs_top_grid: jnp.ndarray,
+def accumulate_B_counts_level1(
+    qs1_grid: jnp.ndarray,
+) -> jnp.ndarray:
+    """
+    Accumulate expected counts for B1 (level-1 transitions).
+
+    Args:
+        qs1_grid: (T, H1, W1, S1)
+
+    Returns:
+        dB1: (S1, S1)
+    """
+    T, H1, W1, S1 = qs1_grid.shape
+
+    qt = qs1_grid[:-1].reshape((T - 1) * H1 * W1, S1)
+    qt1 = qs1_grid[1:].reshape((T - 1) * H1 * W1, S1)
+
+    dB1 = qt.T @ qt1
+    return dB1
+
+
+def accumulate_E_counts_level1(
+    qs1_grid: jnp.ndarray,
+) -> jnp.ndarray:
+    """
+    Accumulate expected counts for E1 (prior over initial states at level 1).
+
+    Args:
+        qs1_grid: (T, H1, W1, S1)
+
+    Returns:
+        dE1: (S1,)
+    """
+    q0 = qs1_grid[0]  # (H1, W1, S1)
+    H1, W1, S1 = q0.shape
+    q0_flat = q0.reshape(H1 * W1, S1)
+    dE1 = q0_flat.sum(axis=0)
+    return dE1
+
+
+# -----------------------------------------------------------------------------
+# 3. Sufficient statistics for path-dependent transitions and paths
+# -----------------------------------------------------------------------------
+
+def accumulate_B_states_paths_counts_level1(
+    qs1_grid: jnp.ndarray,
     qu_top: jnp.ndarray,
 ) -> jnp.ndarray:
     """
     Accumulate expected counts for path-dependent state transitions
-    B_states_paths[s_next, s, u] at the top level.
+    B_states_paths[u, s, s'] at the top level.
 
     Approximation:
-        dB_states_paths[s_next, s, u]
-          ≈ sum_t q(u_t = u)
-             * sum_sites q(s_t = s) q(s_{t+1} = s_next)
+        dB_states_paths[u, s, s']
+          ≈ sum_t q(u_t = u) * sum_{h,w} q(s_t = s) q(s_{t+1} = s').
 
     Args:
-        qs_top_grid: (T, H, W, S_top) top-level posteriors
-        qu_top: (T, U) path posterior at top level
+        qs1_grid: (T, H1, W1, S1)
+        qu_top: (T, U)
 
     Returns:
-        dB_states_paths: (S_top, S_top, U) Dirichlet count increments
+        dB_states_paths: (U, S1, S1)
     """
-    T, H, W, S_top = qs_top_grid.shape
+    T, H1, W1, S1 = qs1_grid.shape
     Tq, U = qu_top.shape
-    assert Tq == T, "qu_top and qs_top_grid must have same T."
+    assert Tq == T, "qu_top and qs1_grid must have same T."
 
-    N_sites = H * W
-    qs_flat = qs_top_grid.reshape(T, N_sites, S_top)  # (T, N_sites, S_top)
+    N_sites = H1 * W1
+    qs1_flat = qs1_grid.reshape(T, N_sites, S1)
 
-    dB_states_paths = jnp.zeros((S_top, S_top, U), dtype=jnp.float32)
+    dB_states_paths = jnp.zeros((U, S1, S1), dtype=jnp.float32)
 
     for t in range(T - 1):
-        qs_t = qs_flat[t]      # (N_sites, S_top)
-        qs_tp1 = qs_flat[t+1]  # (N_sites, S_top)
+        qs_t = qs1_flat[t]
+        qs_tp1 = qs1_flat[t + 1]
 
-        base_t = qs_t.T @ qs_tp1  # (S_top, S_top)
+        base_t = qs_t.T @ qs_tp1  # (S1, S1)
 
-        qu_t = qu_top[t]  # (U,)
+        qu_t = qu_top[t]
         for u in range(U):
-            dB_states_paths = dB_states_paths.at[:, :, u].add(base_t * qu_t[u])
+            dB_states_paths = dB_states_paths.at[u].add(base_t * qu_t[u])
 
-    return dB_states_paths  # (S_top, S_top, U)
+    return dB_states_paths
 
 
 def accumulate_B_E_paths(
     qu_top: jnp.ndarray,
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """
-    Accumulate Dirichlet counts for path transitions B_paths and
-    initial path prior E_paths.
+    Accumulate Dirichlet counts for path transitions B_paths and E_paths.
 
     Args:
-        qu_top: (T, U) posterior over paths at top level
+        qu_top: (T, U)
 
     Returns:
-        dB_paths: (U, U) Dirichlet count increments for B_paths
-        dE_paths: (U,) Dirichlet count increments for E_paths
+        dB_paths: (U, U)
+        dE_paths: (U,)
     """
     T, U = qu_top.shape
+    qu_t = qu_top[:-1]
+    qu_t1 = qu_top[1:]
 
-    qu_t = qu_top[:-1]  # (T-1, U)
-    qu_tp1 = qu_top[1:]  # (T-1, U)
-
-    dB_paths = qu_t.T @ qu_tp1  # (U, U)
-    dE_paths = qu_top[0]        # (U,)
-
+    dB_paths = qu_t.T @ qu_t1
+    dE_paths = qu_top[0]
     return dB_paths, dE_paths
 
 
 # -----------------------------------------------------------------------------
-# 3. Update Dirichlet parameters from a single sequence
+# 4. Update Dirichlet parameters from a single sequence
 # -----------------------------------------------------------------------------
 
 def update_dirichlet_from_sequence(
     hierarchy: LorenzHierarchy,
     params: LorenzRGMParams,
     lorenz_data_dict: Dict[str, Any],
-    num_iter_lowest: int = 8,
-    num_iter_hier: int = 2,
-    efe_gamma: float = 16.0,
-    pref_mode: str = "data_empirical",
+    num_iter_lowest: int,
+    num_iter_hier: int,
+    efe_gamma: float,
+    pref_mode: str,
 ) -> LorenzRGMParams:
     """
-    Update Dirichlet parameters (A_alpha, B_alpha, E_alpha, C_alpha,
-    and optionally B_states_paths_alpha, B_paths_alpha, E_paths_alpha)
-    given a single Lorenz sequence.
-
-    This function:
-      1. Builds observations at the lowest level.
-      2. Runs hierarchical inference to obtain qs_levels and qu_levels.
-      3. Accumulates Dirichlet counts for A/B/E/C across levels.
-      4. Accumulates path-related counts at the top level if present.
-      5. Adds these counts to the current params.
+    Run inference for a single Lorenz sequence and update Dirichlet
+    concentration parameters A_alpha, B_alpha, E_alpha, C_alpha,
+    and, if available, B_states_paths_alpha, B_paths_alpha, E_paths_alpha.
 
     Args:
-        hierarchy: LorenzHierarchy used for inference
+        hierarchy: current LorenzHierarchy
         params: current LorenzRGMParams
-        lorenz_data_dict: dataset dict for this sequence
-        num_iter_lowest: iterations of lowest-level VMP
-        num_iter_hier: iterations of hierarchical updates
-        efe_gamma: precision for EFE-based path selection
-        pref_mode: mode for preferences ("uniform" or "data_empirical")
+        lorenz_data_dict: data dict for this sequence
+        num_iter_lowest: iterations for lowest-level VMP
+        num_iter_hier: iterations for hierarchical VMP
+        efe_gamma: precision over EFE
+        pref_mode: preference mode
 
     Returns:
-        Updated LorenzRGMParams.
+        Updated LorenzRGMParams
     """
-    # 1. Build lowest-level observations and preferences
-    obs_grid0 = build_lowest_level_observations_grid(lorenz_data_dict)  # (T,H0,W0,O0)
-    O0 = obs_grid0.shape[-1]
+    # 1. Observations as grid
+    obs_grid = build_lowest_level_observations_grid(lorenz_data_dict)
 
-    if pref_mode == "data_empirical":
-        C0 = build_lowest_level_observations_grid(lorenz_data_dict).mean(axis=(0, 1, 2))
-        C0 = C0 / (C0.sum() + 1e-8)
-    else:
-        C0 = jnp.ones((O0,), dtype=jnp.float32)
-        C0 = C0 / C0.sum()
-
-    # 2. Run hierarchical inference
-    infer_res = infer_lorenz_hierarchy(
+    # 2. Inference (positional args to match infer_lorenz_hierarchy signature)
+    results = infer_lorenz_hierarchy(
         hierarchy,
         lorenz_data_dict,
-        C0,
-        num_iter_lowest=num_iter_lowest,
-        num_iter_hier=num_iter_hier,
-        efe_gamma=efe_gamma,
+        num_iter_lowest,
+        num_iter_hier,
+        efe_gamma,
+        pref_mode,
     )
-    qs_levels = infer_res["qs_levels"]
-    qu_levels = infer_res["qu_levels"]
 
-    # 3. Accumulate A/B/E/C counts
+    qs_levels = results["qs_levels"]
+    qu_levels = results["qu_levels"]
 
-    # Lowest level (level 0)
     qs0_grid = qs_levels[0]
-    dA0 = accumulate_A_counts_level0(qs0_grid, obs_grid0)
-    dB0 = accumulate_B_counts_level(qs0_grid)
-    dE0 = accumulate_E_counts_level(qs0_grid)
-    dC0 = accumulate_C_counts(obs_grid0)
+    qs1_grid = qs_levels[1] if len(qs_levels) > 1 else None
+    qu_top = qu_levels[-1] if len(qu_levels) > 1 else None
+
+    # 3. Level 0 counts
+    dA0 = accumulate_A_counts_level0(qs0_grid, obs_grid)
+    dB0 = accumulate_B_counts_level0(qs0_grid)
+    dE0 = accumulate_E_counts_level0(qs0_grid)
+    dC0 = accumulate_C_counts(obs_grid)
 
     params.A_alpha[0] = params.A_alpha[0] + dA0
     params.B_alpha[0] = params.B_alpha[0] + dB0
     params.E_alpha[0] = params.E_alpha[0] + dE0
     params.C_alpha = params.C_alpha + dC0
 
-    # Higher levels
-    for l in range(1, len(hierarchy.levels)):
-        qs_l = qs_levels[l]
-        if qs_l is None:
-            continue
+    # 4. Level 1 counts (if present)
+    if qs1_grid is not None and len(params.B_alpha) > 1:
+        dB1 = accumulate_B_counts_level1(qs1_grid)
+        dE1 = accumulate_E_counts_level1(qs1_grid)
+        params.B_alpha[1] = params.B_alpha[1] + dB1
+        params.E_alpha[1] = params.E_alpha[1] + dE1
 
-        dB_l = accumulate_B_counts_level(qs_l)
-        dE_l = accumulate_E_counts_level(qs_l)
+    # 5. Path counts at top level
+    if (
+        qu_top is not None
+        and params.B_paths_alpha is not None
+        and params.E_paths_alpha is not None
+    ):
+        dB_paths, dE_paths = accumulate_B_E_paths(qu_top)
+        params.B_paths_alpha = params.B_paths_alpha + dB_paths
+        params.E_paths_alpha = params.E_paths_alpha + dE_paths
 
-        params.B_alpha[l] = params.B_alpha[l] + dB_l
-        params.E_alpha[l] = params.E_alpha[l] + dE_l
-
-    # 4. Path-related counts at top level (if any)
-    top_idx = len(hierarchy.levels) - 1
-    level_top = hierarchy.levels[top_idx]
-    qu_top = qu_levels[top_idx] if top_idx < len(qu_levels) else None
-
-    if level_top.num_paths > 1 and qu_top is not None:
-        qs_top_grid = qs_levels[top_idx]
-
-        # B_states_paths_alpha: (S_top, S_top, U)
-        if params.B_states_paths_alpha is not None:
-            dB_states_paths = accumulate_B_states_paths_counts_top(
-                qs_top_grid, qu_top
-            )
-            params.B_states_paths_alpha = params.B_states_paths_alpha + dB_states_paths
-
-        # B_paths_alpha and E_paths_alpha
-        if params.B_paths_alpha is not None and params.E_paths_alpha is not None:
-            dB_paths, dE_paths = accumulate_B_E_paths(qu_top)
-            params.B_paths_alpha = params.B_paths_alpha + dB_paths
-            params.E_paths_alpha = params.E_paths_alpha + dE_paths
+    # 6. Path-dependent state transitions at top level (if enabled)
+    if (
+        qs1_grid is not None
+        and qu_top is not None
+        and params.B_states_paths_alpha is not None
+    ):
+        dB_states_paths = accumulate_B_states_paths_counts_level1(qs1_grid, qu_top)
+        params.B_states_paths_alpha = params.B_states_paths_alpha + dB_states_paths
 
     return params
 
 
 # -----------------------------------------------------------------------------
-# 4. Outer training loop (multiple epochs / sequences)
+# 5. Normalize Dirichlet parameters to categorical A/B/E/C and paths
+# -----------------------------------------------------------------------------
+
+def params_to_categorical(
+    params: LorenzRGMParams,
+    K: int,
+    L: int,
+) -> Tuple[
+    List[jnp.ndarray],
+    List[jnp.ndarray],
+    List[jnp.ndarray],
+    jnp.ndarray,
+    Optional[jnp.ndarray],
+    Optional[jnp.ndarray],
+    Optional[jnp.ndarray],
+]:
+    """
+    Convert Dirichlet concentration parameters into categorical parameters
+    for inference: A, B, E, C, and (if present) B_states_paths, B_paths, E_paths.
+
+    Args:
+        params: LorenzRGMParams
+        K, L: lowest-level configuration (O0 = K * L)
+
+    Returns:
+        A_list, B_list, E_list, C0, B_states_paths, B_paths, E_paths
+    """
+    A_list: List[jnp.ndarray] = []
+    B_list: List[jnp.ndarray] = []
+    E_list: List[jnp.ndarray] = []
+
+    for A_alpha_l, B_alpha_l, E_alpha_l in zip(
+        params.A_alpha, params.B_alpha, params.E_alpha
+    ):
+        if A_alpha_l.size > 0:
+            A_l = A_alpha_l / (A_alpha_l.sum(axis=1, keepdims=True) + 1e-8)
+        else:
+            A_l = A_alpha_l
+
+        B_l = B_alpha_l / (B_alpha_l.sum(axis=1, keepdims=True) + 1e-8)
+        E_l = E_alpha_l / (E_alpha_l.sum() + 1e-8)
+
+        A_list.append(A_l)
+        B_list.append(B_l)
+        E_list.append(E_l)
+
+    O0 = K * L
+    C0 = params.C_alpha / (params.C_alpha.sum() + 1e-8)
+    assert C0.shape[0] == O0, "C0 shape mismatch with K*L."
+
+    if params.B_paths_alpha is not None and params.E_paths_alpha is not None:
+        B_paths = params.B_paths_alpha / (
+            params.B_paths_alpha.sum(axis=1, keepdims=True) + 1e-8
+        )
+        E_paths = params.E_paths_alpha / (params.E_paths_alpha.sum() + 1e-8)
+    else:
+        B_paths, E_paths = None, None
+
+    if params.B_states_paths_alpha is not None:
+        B_states_paths = params.B_states_paths_alpha / (
+            params.B_states_paths_alpha.sum(axis=2, keepdims=True) + 1e-8
+        )
+    else:
+        B_states_paths = None
+
+    return A_list, B_list, E_list, C0, B_states_paths, B_paths, E_paths
+
+
+# -----------------------------------------------------------------------------
+# 6. Training loop scaffold
+# -----------------------------------------------------------------------------
+
+def train_lorenz_rgm(
+    initial_params: LorenzRGMParams,
+    lorenz_spatial_hierarchy: Dict[str, Any],
+    build_data_fn,
+    K: int,
+    L: int,
+    num_epochs: int = 1,
+    num_sequences_per_epoch: int = 1,
+    num_iter_lowest: int = 8,
+    num_iter_hier: int = 4,
+    efe_gamma: float = 16.0,
+    pref_mode: str = "data_empirical",
+    num_paths_top: int = 4,
+) -> LorenzRGMParams:
+    """
+    High-level training loop scaffold for the Lorenz RGM.
+
+    For each sequence:
+      1. Build Lorenz data via build_data_fn.
+      2. Build a hierarchy from current params and spatial hierarchy.
+      3. Run inference and update Dirichlet parameters.
+
+    Returns:
+        Trained LorenzRGMParams
+    """
+    params = initial_params
+
+    for epoch in range(num_epochs):
+        for seq_idx in range(num_sequences_per_epoch):
+            lorenz_data_dict = build_data_fn()
+
+            hierarchy = build_lorenz_hierarchy_from_params(
+                lorenz_spatial_hierarchy,
+                params,
+                num_paths_top=num_paths_top,
+            )
+
+            params = update_dirichlet_from_sequence(
+                hierarchy,
+                params,
+                lorenz_data_dict,
+                num_iter_lowest,
+                num_iter_hier,
+                efe_gamma,
+                pref_mode,
+            )
+
+    return params
+
+
+# -----------------------------------------------------------------------------
+# 7. Convenience wrapper: single-hierarchy training (used by notebook)
 # -----------------------------------------------------------------------------
 
 def train_lorenz_rgm_with_tau(
@@ -319,45 +462,20 @@ def train_lorenz_rgm_with_tau(
     pref_mode: str = "data_empirical",
 ) -> LorenzRGMParams:
     """
-    Simple training loop over a single Lorenz trajectory (or dataset),
-    alternating between inference and parameter updates.
+    Minimal training loop used by the notebook:
+    reuse a single hierarchy and dataset, iterating Dirichlet updates.
 
-    Args:
-        hierarchy: initial LorenzHierarchy
-        params: initial Dirichlet parameters
-        lorenz_data_dict: data dict for training
-        num_epochs: number of passes over the data
-        num_iter_lowest: iterations for lowest-level VMP
-        num_iter_hier: iterations for hierarchical updates
-        efe_gamma: precision for EFE-based path selection
-        pref_mode: preference mode ("uniform" or "data_empirical")
-
-    Returns:
-        Updated LorenzRGMParams.
+    This is a thin wrapper around update_dirichlet_from_sequence.
     """
     for epoch in range(num_epochs):
         print(f"train_lorenz_rgm_with_tau(): Epoch {epoch+1}/{num_epochs}")
-
         params = update_dirichlet_from_sequence(
             hierarchy,
             params,
             lorenz_data_dict,
-            num_iter_lowest=num_iter_lowest,
-            num_iter_hier=num_iter_hier,
-            efe_gamma=efe_gamma,
-            pref_mode=pref_mode,
+            num_iter_lowest,
+            num_iter_hier,
+            efe_gamma,
+            pref_mode,
         )
-
-        # Rebuild hierarchy from updated params to use learned A/B/E/path
-        hierarchy = build_lorenz_hierarchy_from_params(
-            lorenz_spatial_hierarchy={
-                "levels": hierarchy.states_grids,  # states_grids reused
-                "T": hierarchy.T,
-                "H_blocks": hierarchy.H_blocks,
-                "W_blocks": hierarchy.W_blocks,
-            },
-            params=params,
-            num_paths_top=hierarchy.levels[-1].num_paths,
-        )
-
     return params
