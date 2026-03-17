@@ -3,18 +3,21 @@
 Variational message passing for the Lorenz hierarchy.
 
 This module provides:
-- Single-chain VMP for the lowest (patch) level using A, B_states, E_states.
+- Single-chain VMP for the lowest (patch) level using A, B_states_paths (U=1),
+  and E_states.
 - Patch-wise lowest-level inference by looping over patches and calling
   the single-chain VMP (to keep memory usage manageable).
 - Two-level state inference with spatial renormalization:
-  * bottom-up messages from level 0 to level 1 via D
-  * top-down messages from level 1 to level 0 via D
-- Top-level path inference using expected free energy over paths
-  computed via lorenz_efe (risk + ambiguity - epistemic), with
-  path-dependent transitions B_states_paths at the top state level.
+    * bottom-up messages from level 0 to level 1 via D_state_from_parent
+    * top-down messages from level 1 to level 0 via D_state_from_parent
+  using path-marginal (effective) dynamics at level 1.
+- Top-level path inference using expected free energy over paths computed
+  via lorenz_efe (risk + ambiguity - epistemic), with path-dependent
+  transitions B_states_paths and path dynamics C_paths,E_paths.
 
-This is a Lorenz-specific instance of RGM-style inference and is structured
-to be extended further for full RGM behaviour.
+NOTE: Temporal renormalization (block structure using T0,T1,T2,K0,K1) is
+encoded in LorenzHierarchy but not yet exploited here; all levels currently
+use T0 as the time index. This will be extended in the next stage.
 """
 
 from typing import List, Dict, Any, Tuple, Optional
@@ -29,7 +32,6 @@ from .lorenz_efe import (
     compute_expected_free_energy_paths,
     update_path_posterior_from_G,
 )
-
 
 # -----------------------------------------------------------------------------
 # 1. Utilities: observations and preferences for lowest level
@@ -122,12 +124,12 @@ def vmp_single_chain(
 
     Args:
       A: (S, O)
-      B: (S, S)
-      E: (S,)
-      obs: (T, O)
+      B: (S, S) with B[s_next, s] = P(s_next | s)
+      E: (S,) initial state prior
+      obs: (T, O) one-hot or categorical observations
 
     Returns:
-      qs: (T, S)
+      qs: (T, S) approximate posterior over states
     """
     T = obs.shape[0]
     S = A.shape[0]
@@ -191,7 +193,9 @@ def infer_lowest_level_patches(
       qs0_grid: (T, H0, W0, S0)
     """
     A0 = level0.A
-    B0 = level0.B_states
+    if level0.B_states_paths is None:
+        raise ValueError("level0 must define B_states_paths with U0=1.")
+    B0 = level0.B_states_paths[:, :, 0]  # (S0, S0)
     E0 = level0.E_states
 
     obs_grid = build_lowest_level_observations_grid(lorenz_data_dict)  # (T, H0, W0, O)
@@ -226,7 +230,7 @@ def bottom_up_message_level0_to_level1(
 
     Args:
       qs0_grid: (T, H0, W0, S0)
-      D1: (S1, 4)
+      D1: (S1, 4) mapping each parent state to its 4 child indices
       states_grid1: (T, H1, W1)
 
     Returns:
@@ -278,14 +282,15 @@ def vmp_two_level_states(
     num_iter: int = 4,
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """
-    Coupled VMP over Level-0 and Level-1 states with path-dependent B1 at top.
+    Coupled VMP over Level-0 and Level-1 states with path-dependent dynamics
+    at level 1.
 
     Args:
       level0: lowest-level LorenzLevel
       level1: parent-level LorenzLevel
       qs0_grid: (T, H0, W0, S0)
       states_grid1: (T, H1, W1)
-      qu_top: (T, U) or None
+      qu_top: (T, U) or None (path posterior at this level)
       num_iter: alternating sweeps
 
     Returns:
@@ -293,13 +298,16 @@ def vmp_two_level_states(
       qs1_final: (T, H1, W1, S1)
     """
     A0 = level0.A
-    B0 = level0.B_states
+    if level0.B_states_paths is None:
+        raise ValueError("level0 must define B_states_paths with U0=1.")
+    B0 = level0.B_states_paths[:, :, 0]  # (S0, S0)
     E0 = level0.E_states
 
-    B1 = level1.B_states
+    B1_base = None  # no separate stored B; we derive B_eff from B_states_paths
     E1 = level1.E_states
-    D1 = level1.D
-    # B_states_paths has shape (S1, S1, U) if present
+    D1 = level1.D_state_from_parent
+    if D1 is None:
+        raise ValueError("level1 must define D_state_from_parent.")
     B_states_paths = level1.B_states_paths  # (S1, S1, U) or None
 
     T, H0, W0, S0 = qs0_grid.shape
@@ -307,7 +315,11 @@ def vmp_two_level_states(
     assert T == T1
     assert H0 == 2 * H1 and W0 == 2 * W1
 
-    S1 = int(B1.shape[0])
+    if B_states_paths is not None:
+        S1 = int(B_states_paths.shape[0])
+    else:
+        # fallback: treat as single-path with identity transitions
+        S1 = int(D1.shape[0])
     qs1_grid = jnp.full((T, H1, W1, S1), 1.0 / S1, dtype=jnp.float32)
 
     # Effective path posterior
@@ -333,14 +345,17 @@ def vmp_two_level_states(
         )  # (T, H1, W1, S1)
 
         if B_states_paths is not None and qu_current is not None:
-
+            # B_eff[t] = sum_u q(u_t=u) * B_states_paths[:,:,u]
             def B_eff_for_time(t):
                 qu_t = qu_current[t]  # (U,)
                 return (B_states_paths * qu_t[None, None, :]).sum(axis=2)  # (S1, S1)
 
             B_eff_all = jax.vmap(B_eff_for_time)(jnp.arange(T))  # (T, S1, S1)
         else:
-            B_eff_all = jnp.broadcast_to(B1, (T, S1, S1))
+            # Use identity (no dynamics) if no B_states_paths available
+            B_eff_all = jnp.broadcast_to(
+                jnp.eye(S1, dtype=jnp.float32), (T, S1, S1)
+            )
 
         def update_site_chain(
             qs1_chain: jnp.ndarray,
@@ -394,9 +409,9 @@ def vmp_two_level_states(
         w_indices = jnp.arange(W1_)
 
         def update_site(h_idx, w_idx, qs1_curr, log_lik1_all, B_all):
-            qs_chain = qs1_curr[:, h_idx, w_idx, :]  # (T, S1)
-            log_chain = log_lik1_all[:, h_idx, w_idx, :]  # (T, S1)
-            B_chain = B_all  # (T, S1, S1)
+            qs_chain = qs1_curr[:, h_idx, w_idx, :]        # (T, S1)
+            log_chain = log_lik1_all[:, h_idx, w_idx, :]   # (T, S1)
+            B_chain = B_all                                # (T, S1, S1)
             return update_site_chain(qs_chain, log_chain, B_chain)
 
         def update_row(h_idx, qs1_curr, log_lik1_all, B_all):
@@ -533,10 +548,13 @@ def infer_lorenz_hierarchy(
     """
     Run variational inference over states and (optional) paths in the Lorenz hierarchy.
 
-    If the top level has a proper path factor (num_paths > 1 and B_paths/E_paths
-    are not None), we run EFE-based path inference; otherwise we only infer states.
+    For now:
+      - We infer states at level 0 and (if present) level 1 over the T0 time index.
+      - If the top level has a proper path factor (num_paths > 1 and C_paths/E_paths
+        are not None), we run EFE-based path inference at that level; otherwise
+        we only infer states.
     """
-    T = hierarchy.T
+    T0 = hierarchy.T0
     H0 = hierarchy.H_blocks
     W0 = hierarchy.W_blocks
 
@@ -546,14 +564,14 @@ def infer_lorenz_hierarchy(
 
     obs_flat = build_lowest_level_observations_flat(lorenz_data_dict)  # (N, O)
     N = obs_flat.shape[0]
-    assert N == T * H0 * W0, "Observation length mismatch."
+    assert N == T0 * H0 * W0, "Observation length mismatch."
 
-    C = build_preference_distribution_lowest(O, mode=pref_mode, obs_flat=obs_flat)
+    C_pref = build_preference_distribution_lowest(O, mode=pref_mode, obs_flat=obs_flat)
 
     # 1. Level-0 states
     qs0_grid = infer_lowest_level_patches(
         level0, lorenz_data_dict, num_iter_lowest=num_iter_lowest
-    )
+    )  # (T0, H0, W0, S0)
 
     qs_levels: List[Optional[jnp.ndarray]] = [qs0_grid]
     qu_levels: List[Optional[jnp.ndarray]] = [None]
@@ -561,7 +579,8 @@ def infer_lorenz_hierarchy(
     qs1_grid = None
     qu_top = None
 
-    # For now we only implement a 2-level state hierarchy with paths at level 1.
+    # For now we only implement a 2-level state hierarchy (0 and 1) with
+    # paths potentially at the highest level in hierarchy.levels.
     if len(hierarchy.levels) > 1:
         level1: LorenzLevel = hierarchy.levels[1]
         states_grid1 = hierarchy.states_grids[1]
@@ -570,23 +589,23 @@ def infer_lorenz_hierarchy(
         level_top = hierarchy.levels[top_idx]
 
         # Only treat paths as active if we have a full path factor:
-        # more than one path and both B_paths and E_paths defined.
+        # more than one path and both C_paths and E_paths defined.
         paths_active = (
             level_top.num_paths is not None
             and level_top.num_paths > 1
-            and level_top.B_paths is not None
+            and level_top.C_paths is not None
             and level_top.E_paths is not None
         )
 
         if paths_active:
             U = level_top.num_paths
-            qu_top = jnp.full((T, U), 1.0 / U, dtype=jnp.float32)
+            qu_top = jnp.full((T0, U), 1.0 / U, dtype=jnp.float32)
         else:
             qu_top = None
 
         qs0_current = qs0_grid
         qs1_current = jnp.full(
-            (T, states_grid1.shape[1], states_grid1.shape[2], level1.S),
+            (T0, states_grid1.shape[1], states_grid1.shape[2], level1.S),
             1.0 / level1.S,
             dtype=jnp.float32,
         )
@@ -607,8 +626,8 @@ def infer_lorenz_hierarchy(
                     level0,
                     qs1_current,
                     qs0_current,
-                    C,
-                    tau=2,  # planning horizon, kept fixed here
+                    C_pref,
+                    tau=2,  # planning horizon (can be tuned)
                 )
 
                 qu_top = update_path_posterior_from_G(
