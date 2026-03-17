@@ -29,6 +29,9 @@ from typing import Dict, Any, Tuple, List, Optional
 import numpy as np
 import jax.numpy as jnp
 
+# Global debug flag
+DEBUG_RENORM = False
+
 # -----------------------------------------------------------------------------
 # 1. Utilities: reshape between flat and grid states
 # -----------------------------------------------------------------------------
@@ -66,7 +69,6 @@ def states_grid_to_flat(states_grid: jnp.ndarray) -> jnp.ndarray:
     """
     T, H, W = states_grid.shape
     return states_grid.reshape(T * H * W,)
-
 
 # -----------------------------------------------------------------------------
 # 2. Single RG step over space (2x2 blocks) with explicit mapping
@@ -115,8 +117,8 @@ def rg_step_level(states_grid: jnp.ndarray) -> Dict[str, Any]:
       - group 2x2 blocks into "group-sites" with four child positions,
       - for each group-site (h2,w2), build a local mapping from unique
         child patterns to parent states, ensuring:
-          * no shared children between different group-sites (by construction),
-          * unique rows in D for each parent (one row per pattern).
+        * no shared children between different group-sites (by construction),
+        * unique rows in D for each parent (one row per pattern).
 
     Args:
       states_grid: (T, H, W) integer states at current level.
@@ -125,7 +127,7 @@ def rg_step_level(states_grid: jnp.ndarray) -> Dict[str, Any]:
       dict with:
         'parent_states_grid': (T, H2, W2) integer parent states
         'group_pattern_maps': list (length H2 * W2) of dicts
-            pattern_tuple (4,) -> parent_state_idx (global int)
+           pattern_tuple (4,) -> parent_state_idx (global int)
         'D': (num_parent_states_total, 4) child state patterns
         'group_shape': (H2, W2)
         'num_parent_states_total': total number of parent states
@@ -194,7 +196,6 @@ def rg_step_level(states_grid: jnp.ndarray) -> Dict[str, Any]:
         "num_parent_states_total": num_parent_states_total,
     }
 
-
 # -----------------------------------------------------------------------------
 # 3. Recursive RG across multiple spatial levels (level-agnostic)
 # -----------------------------------------------------------------------------
@@ -223,16 +224,16 @@ def build_spatial_hierarchy(
     Returns:
       dict with:
         'levels': list of level dicts, l = 0..L
-          level[0]:
-            {'states_grid': (T,H0,W0),
-             'group_shape': (H0,W0),
-             'D': None,
-             'group_pattern_maps': None}
-          level[l>0]:
-            {'states_grid': (T,H_l,W_l),
-             'group_shape': (H_l,W_l),
-             'D': (S_l,4),
-             'group_pattern_maps': list of dicts}
+        level[0]:
+          {'states_grid': (T,H0,W0),
+           'group_shape': (H0,W0),
+           'D': None,
+           'group_pattern_maps': None}
+        level[l>0]:
+          {'states_grid': (T,H_l,W_l),
+           'group_shape': (H_l,W_l),
+           'D': (S_l,4),
+           'group_pattern_maps': list of dicts}
         'T': T
     """
     assert num_levels >= 0, "num_levels must be >= 0."
@@ -282,7 +283,6 @@ def build_spatial_hierarchy(
         "T": T,
     }
 
-
 # -----------------------------------------------------------------------------
 # 4. Convenience wrapper: from lorenz_data output
 # -----------------------------------------------------------------------------
@@ -304,7 +304,7 @@ def build_lorenz_spatial_hierarchy(
       dict with:
         'levels': list of level dicts (see build_spatial_hierarchy)
         'T': T (T0)
-      plus copies of useful fields from lorenz_data_dict:
+        plus copies of useful fields from lorenz_data_dict:
         'H_blocks', 'W_blocks', 'K', 'L', 'patch_size', 'img_size'
     """
     states_flat = lorenz_data_dict["states"]
@@ -331,8 +331,17 @@ def build_lorenz_spatial_hierarchy(
         "img_size": int(lorenz_data_dict["img_size"]),
     }
 
-    return result
+    if DEBUG_RENORM:
+        levels = result["levels"]
+        print("[build_lorenz_spatial_hierarchy] Spatial levels summary:")
+        for idx, lvl in enumerate(levels):
+            grid = lvl["states_grid"]
+            H_l, W_l = grid.shape[1], grid.shape[2]
+            D = lvl["D"]
+            S_l = D.shape[0] if D is not None else grid.max() + 1
+            print(f"  Level {idx}: (H,W)=({H_l},{W_l}), S_l≈{S_l}")
 
+    return result
 
 # -----------------------------------------------------------------------------
 # 5. Consistency check: verify D vs child patterns at level 1
@@ -347,9 +356,9 @@ def check_spatial_hierarchy_consistency(
     """
     Verify that (at least) the first RG level is consistent:
 
-      - For randomly sampled times and group-sites at level 1,
-        the D row corresponding to the parent state matches exactly
-        the 4 child states at level 0.
+    - For randomly sampled times and group-sites at level 1,
+      the D row corresponding to the parent state matches exactly
+      the 4 child states at level 0.
 
     Args:
       lorenz_data_dict: original data dict (for level-0 states)
