@@ -17,6 +17,10 @@ IMPORTANT:
   This is a tractable approximation to the pixel-pattern based RG
   described in the RGM paper and may be revised in future for closer
   fidelity.
+
+NOTE:
+- The symbol T here corresponds to the lowest-level time horizon T0
+  used in LorenzHierarchy (T0 = number of fine-scale steps).
 """
 
 from typing import Dict, Any, Tuple
@@ -24,7 +28,6 @@ from typing import Dict, Any, Tuple
 import numpy as np
 import jax.numpy as jnp
 from scipy.integrate import solve_ivp
-
 
 # -----------------------------------------------------------------------------
 # 1. Lorenz simulation
@@ -48,13 +51,13 @@ def simulate_lorenz(
     dz/dt = x * y - beta * z
 
     Args:
-        T: number of time steps
-        dt: step size
-        sigma, rho, beta: Lorenz parameters
-        x0, y0, z0: initial conditions
+      T: number of time steps (this is T0 at the lowest RGM level)
+      dt: step size
+      sigma, rho, beta: Lorenz parameters
+      x0, y0, z0: initial conditions
 
     Returns:
-        traj: (T, 3) array of [x, y, z] over time
+      traj: (T, 3) array of [x, y, z] over time
     """
     def lorenz_rhs(t, xyz):
         x, y, z = xyz
@@ -65,7 +68,8 @@ def simulate_lorenz(
 
     t_span = (0.0, (T - 1) * dt)
     t_eval = np.linspace(t_span[0], t_span[1], T)
-    sol = solve_ivp(lorenz_rhs, t_span, [x0, y0, z0], t_eval=t_eval, rtol=1e-6, atol=1e-9)
+    sol = solve_ivp(lorenz_rhs, t_span, [x0, y0, z0], t_eval=t_eval,
+                    rtol=1e-6, atol=1e-9)
     traj = sol.y.T  # (T, 3)
     return traj
 
@@ -88,12 +92,12 @@ def render_lorenz_to_images(
     - Draw a thin line at the corresponding position in a 2D image.
 
     Args:
-        traj: (T, 3) Lorenz trajectory
-        img_size: image height and width
-        thickness: integer controlling line thickness (dilation)
+      traj: (T, 3) Lorenz trajectory
+      img_size: image height and width
+      thickness: integer controlling line thickness (dilation)
 
     Returns:
-        images: (T, img_size, img_size) grayscale images in [0, 1]
+      images: (T, img_size, img_size) grayscale images in [0, 1]
     """
     T = traj.shape[0]
     images = np.zeros((T, img_size, img_size), dtype=np.float32)
@@ -142,14 +146,14 @@ def extract_patches(
     Extract non-overlapping patches from images.
 
     Args:
-        images: (T, H, W) grayscale images
-        patch_size: patch dimension (patch_size x patch_size)
+      images: (T, H, W) grayscale images
+      patch_size: patch dimension (patch_size x patch_size)
 
     Returns:
-        patches: (N, P) flattened patches, N = T * H_blocks * W_blocks,
-                 P = patch_size * patch_size
-        H_blocks: number of patches vertically
-        W_blocks: number of patches horizontally
+      patches: (N, P) flattened patches, N = T * H_blocks * W_blocks,
+               P = patch_size * patch_size
+      H_blocks: number of patches vertically
+      W_blocks: number of patches horizontally
     """
     T, H, W = images.shape
     assert H % patch_size == 0 and W % patch_size == 0, "Image dims must be multiples of patch_size."
@@ -181,13 +185,13 @@ def compute_svd_basis_over_patches(
     Compute an SVD basis over all patches.
 
     Args:
-        patches: (N, P) flattened patches
-        K: number of singular vectors to keep
+      patches: (N, P) flattened patches
+      K: number of singular vectors to keep
 
     Returns:
-        U: (N, K) left singular vectors (per-patch coefficients, unscaled)
-        S: (K,) singular values
-        Vt: (K, P) right singular vectors (basis images)
+      U: (N, K) left singular vectors (per-patch coefficients, unscaled)
+      S: (K,) singular values
+      Vt: (K, P) right singular vectors (basis images)
     """
     # Center patches
     patches_centered = patches - patches.mean(axis=0, keepdims=True)
@@ -212,13 +216,13 @@ def quantize_coefficients(
     Quantize SVD coefficients into L bins per component.
 
     Args:
-        coeffs: (N, K) SVD coefficients (U or U*S)
-        L: number of quantization levels per component
+      coeffs: (N, K) SVD coefficients (U or U*S)
+      L: number of quantization levels per component
 
     Returns:
-        q_coeffs: (N, K) integer quantized indices in {0,...,L-1}
-        bin_edges: (K, L+1) bin boundaries per component
-        bin_centers: (K, L) bin centers per component
+      q_coeffs: (N, K) integer quantized indices in {0,...,L-1}
+      bin_edges: (K, L+1) bin boundaries per component
+      bin_centers: (K, L) bin centers per component
     """
     N, K = coeffs.shape
     q_coeffs = np.zeros((N, K), dtype=np.int32)
@@ -252,14 +256,14 @@ def encode_mixed_radix_states(
     For K components and L levels per component, each patch's discrete
     state is:
 
-        s = sum_{k=0..K-1} q_coeffs[n, k] * L^k
+      s = sum_{k=0..K-1} q_coeffs[n, k] * L^k
 
     Args:
-        q_coeffs: (N, K) integer quantized coefficients
-        L: number of levels per component
+      q_coeffs: (N, K) integer quantized coefficients
+      L: number of levels per component
 
     Returns:
-        states: (N,) integer encoded states in {0,...,L^K-1}
+      states: (N,) integer encoded states in {0,...,L^K-1}
     """
     N, K = q_coeffs.shape
     bases = (L ** np.arange(K, dtype=np.int64)).reshape(1, K)  # (1, K)
@@ -284,7 +288,7 @@ def build_lorenz_patch_dataset(
     Build a dataset for the Lorenz RGM at the patch level.
 
     Steps:
-      1. Simulate a Lorenz trajectory of length T.
+      1. Simulate a Lorenz trajectory of length T (this T will be T0 in RGM).
       2. Render the trajectory into grayscale images of size img_size x img_size.
       3. Extract non-overlapping patches of size patch_size x patch_size
          from each image.
@@ -294,27 +298,29 @@ def build_lorenz_patch_dataset(
          per patch, giving discrete level-0 states.
 
     Args:
-        T: number of time steps
-        dt: time step for Lorenz simulation
-        img_size: size of rendered images (pixels)
-        patch_size: patch side length (pixels)
-        K: number of SVD components to keep
-        L: number of quantization levels per component
-        thickness: line thickness for rendering Lorenz trajectory
+      T: number of time steps (T0 at the lowest RGM level)
+      dt: time step for Lorenz simulation
+      img_size: size of rendered images (pixels)
+      patch_size: patch side length (pixels)
+      K: number of SVD components to keep
+      L: number of quantization levels per component
+      thickness: line thickness for rendering Lorenz trajectory
 
     Returns:
-        lorenz_data_dict with keys:
-            - 'traj': (T, 3) Lorenz states
-            - 'images': (T, img_size, img_size) grayscale images
-            - 'patches': (N, P) flattened patches
-            - 'q_coeffs': (N, K) quantized coefficient indices
-            - 'states': (N,) integer discrete states per patch
-            - 'T': T
-            - 'dt': dt
-            - 'img_size': img_size
-            - 'patch_size': patch_size
-            - 'H_blocks', 'W_blocks': patch grid dimensions
-            - 'K', 'L': SVD/quantization config
+      lorenz_data_dict with keys:
+        - 'traj': (T, 3) Lorenz states
+        - 'images': (T, img_size, img_size) grayscale images
+        - 'patches': (N, P) flattened patches
+        - 'q_coeffs': (N, K) quantized coefficient indices
+        - 'states': (N,) integer discrete states per patch
+        - 'T': T  (interpreted as T0 in RGM)
+        - 'dt': dt
+        - 'img_size': img_size
+        - 'patch_size': patch_size
+        - 'H_blocks', 'W_blocks': patch grid dimensions
+        - 'K', 'L': SVD/quantization config
+        - 'svd_U', 'svd_S', 'svd_Vt': SVD factors
+        - 'bin_edges', 'bin_centers': quantization metadata
     """
     # 1. Simulate Lorenz
     traj = simulate_lorenz(T=T, dt=dt)
@@ -357,4 +363,5 @@ def build_lorenz_patch_dataset(
         "bin_edges": bin_edges,
         "bin_centers": bin_centers,
     }
+
     return lorenz_data_dict
