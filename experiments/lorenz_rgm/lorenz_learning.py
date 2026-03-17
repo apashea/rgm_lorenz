@@ -158,7 +158,7 @@ def accumulate_B_states_paths_counts_level(
 
     # Loop in Python over time and paths; JAX arrays are updated with .at[]
     for t in range(T - 1):
-        qs_t = qs_flat[t]      # (N_sites, S)
+        qs_t = qs_flat[t]        # (N_sites, S)
         qs_tp1 = qs_flat[t + 1]  # (N_sites, S)
 
         # base_t[s, s'] = sum_{h,w} q(s_t = s) q(s_{t+1} = s')
@@ -224,14 +224,15 @@ def update_dirichlet_from_sequence(
     # 1. Observations as grid
     obs_grid = build_lowest_level_observations_grid(lorenz_data_dict)  # (T0, H0, W0, O0)
 
-    # 2. Inference
+    # 2. Inference (now passing params so preferences come from pref_alpha)
     results = infer_lorenz_hierarchy(
         hierarchy,
         lorenz_data_dict,
-        num_iter_lowest,
-        num_iter_hier,
-        efe_gamma,
-        pref_mode,
+        params=params,
+        num_iter_lowest=num_iter_lowest,
+        num_iter_hier=num_iter_hier,
+        efe_gamma=efe_gamma,
+        pref_mode=pref_mode,
     )
 
     qs_levels = results["qs_levels"]
