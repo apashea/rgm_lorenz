@@ -5,12 +5,13 @@ Expected free energy (EFE) computations and path inference for the Lorenz RGM.
 This module provides:
 - Functions to roll out predictive state and observation distributions under
   path-dependent dynamics at the top level.
-- Computation of expected free energy G(t,u) over a finite horizon τ, using
+- Computation of expected free energy G(t,u) over a finite horizon tau, using
   risk, ambiguity, and epistemic components.
 - Variational message passing over the path chain u_t given G(t,u) and
   path dynamics B_paths, E_paths.
 
-CONVENTIONS (consistent with lorenz_model.py, lorenz_learning.py, lorenz_inference.py):
+CONVENTIONS (consistent with lorenz_model.py, lorenz_learning.py,
+lorenz_inference.py):
 
 - For the top level with S_top states and U paths:
 
@@ -41,7 +42,7 @@ from .lorenz_model import LorenzLevel
 
 def rollout_predictive_states_under_path_tau(
     qs0_grid: jnp.ndarray,
-    qs1_grid: jnp.ndarray,
+    qs_top_grid: jnp.ndarray,
     level_top: LorenzLevel,
     level0: LorenzLevel,
     u_idx: int,
@@ -54,63 +55,60 @@ def rollout_predictive_states_under_path_tau(
     For the Lorenz example:
 
     - Level 0 is the patch level (with A0 and B0).
-    - Level 1 (top in current 2-level setup) is the spatial parent level
-      with path-dependent transitions B_states_paths[s_next,s,u].
+    - level_top is the highest spatial level with path-dependent transitions
+      B_states_paths[s_next,s,u].
 
     We approximate q(s_{t+k} | u) and q(o_{t+k} | u) by:
       - Using the latest posterior at t = T-1 as the starting point.
-      - Propagating q(s^1) under B_states_paths[:,:,u_idx].
-      - Propagating q(s^0) under B0 (for ambiguity / risk terms) using
-        the mean over spatial sites.
+      - Propagating q(s^top) under B_states_paths[:,:,u_idx].
+      - Propagating q(s^0) under B0 using the mean over spatial sites.
 
     Args:
         qs0_grid: (T, H0, W0, S0) posterior over level-0 states
-        qs1_grid: (T, H1, W1, S1) posterior over level-1 states
+        qs_top_grid: (T, H_top, W_top, S_top) posterior over top-level states
         level_top: top-level LorenzLevel (with B_states_paths)
-        level0: lowest-level LorenzLevel (with A)
+        level0: lowest-level LorenzLevel (with A, B_states)
         u_idx: index of the path u ∈ {0,...,U-1}
         tau: planning horizon
 
     Returns:
         qs0_pred_u: (tau, S0) predictive distributions over level-0 states
-        qs1_pred_seq_u: (tau, S1) predictive distributions over top-level states
+        qs_top_pred_u: (tau, S_top) predictive distributions over top-level states
         qo_pred_u: (tau, O0) predictive observations at lowest level
     """
-    # Extract relevant shapes and parameters
+    # Lowest level parameters
     B0 = level0.B_states         # (S0, S0)
     A0 = level0.A                # (S0, O0)
 
-    B_states_paths = level_top.B_states_paths  # (S1, S1, U) or (S1, S1, 1) or None
-    S1 = level_top.S
+    # Top level path-dependent transitions
+    B_states_paths = level_top.B_states_paths  # (S_top, S_top, U) or (S_top, S_top, 1) or None
+    S_top = level_top.S
 
     # Start from last posterior time point
-    qs0_last = qs0_grid[-1]  # (H0, W0, S0)
-    qs1_last = qs1_grid[-1]  # (H1, W1, S1)
+    qs0_last = qs0_grid[-1]       # (H0, W0, S0)
+    qs_top_last = qs_top_grid[-1] # (H_top, W_top, S_top)
 
-    # Aggregate over space to get global-ish marginals at each level
-    qs0_global = qs0_last.mean(axis=(0, 1))  # (S0,)
+    # Aggregate over space to get global marginals
+    qs0_global = qs0_last.mean(axis=(0, 1))    # (S0,)
     qs0_global = qs0_global / (qs0_global.sum() + 1e-8)
 
-    qs1_global = qs1_last.mean(axis=(0, 1))  # (S1,)
-    qs1_global = qs1_global / (qs1_global.sum() + 1e-8)
+    qs_top_global = qs_top_last.mean(axis=(0, 1))  # (S_top,)
+    qs_top_global = qs_top_global / (qs_top_global.sum() + 1e-8)
 
-    # Determine which transition kernel to use at top level
+    # Determine top-level transition kernel for this path
     if B_states_paths is not None and B_states_paths.shape[2] > 1:
-        # Path-dependent case: pick B^{(u)} slice
-        B_top_u = B_states_paths[:, :, u_idx]  # (S1, S1)
+        B_top_u = B_states_paths[:, :, u_idx]  # (S_top, S_top)
     elif B_states_paths is not None and B_states_paths.shape[2] == 1:
-        # Single-path case: ignore u_idx
-        B_top_u = B_states_paths[:, :, 0]      # (S1, S1)
+        B_top_u = B_states_paths[:, :, 0]      # (S_top, S_top)
     else:
-        # Fallback: use level_top.B_states (path-free)
-        B_top_u = level_top.B_states           # (S1, S1)
+        B_top_u = level_top.B_states           # (S_top, S_top)
 
     def step(carry, _):
-        qs0_curr, qs1_curr = carry  # (S0,), (S1,)
+        qs0_curr, qs_top_curr = carry  # (S0,), (S_top,)
 
-        # Top level: q_{t+1}^1 = B_top_u @ q_t^1
-        qs1_next = B_top_u @ qs1_curr
-        qs1_next = qs1_next / (qs1_next.sum() + 1e-8)
+        # Top level: q_{t+1}^top = B_top_u @ q_t^top
+        qs_top_next = B_top_u @ qs_top_curr
+        qs_top_next = qs_top_next / (qs_top_next.sum() + 1e-8)
 
         # Lowest level: q_{t+1}^0 = B0 @ q_t^0
         qs0_next = B0 @ qs0_curr
@@ -120,20 +118,20 @@ def rollout_predictive_states_under_path_tau(
         qo_next = A0.T @ qs0_next  # (O0,)
         qo_next = qo_next / (qo_next.sum() + 1e-8)
 
-        new_carry = (qs0_next, qs1_next)
-        out = (qs0_next, qs1_next, qo_next)
+        new_carry = (qs0_next, qs_top_next)
+        out = (qs0_next, qs_top_next, qo_next)
         return new_carry, out
 
-    init_carry = (qs0_global, qs1_global)
-    _, (qs0_seq, qs1_seq, qo_seq) = jax.lax.scan(
+    init_carry = (qs0_global, qs_top_global)
+    _, (qs0_seq, qs_top_seq, qo_seq) = jax.lax.scan(
         step,
         init_carry,
         xs=None,
         length=tau,
     )
 
-    # qs0_seq: (tau, S0), qs1_seq: (tau, S1), qo_seq: (tau, O0)
-    return qs0_seq, qs1_seq, qo_seq
+    # qs0_seq: (tau, S0), qs_top_seq: (tau, S_top), qo_seq: (tau, O0)
+    return qs0_seq, qs_top_seq, qo_seq
 
 
 # -----------------------------------------------------------------------------
@@ -200,8 +198,8 @@ def compute_ambiguity_term(
     return ambiguity
 
 
-def compute_epistemic_term_from_qs1_pred(
-    qs1_pred_seq: jnp.ndarray,
+def compute_epistemic_term_from_qs_top_pred(
+    qs_top_pred: jnp.ndarray,
 ) -> jnp.ndarray:
     """
     Compute a simple epistemic term from the entropy of top-level
@@ -210,19 +208,19 @@ def compute_epistemic_term_from_qs1_pred(
     For now, we approximate epistemic value as the negative entropy of
     the predictive state distribution:
 
-        epistemic_k ≈ -H[q(s^1_{t+k}|u)]
+        epistemic_k ≈ -H[q(s^top_{t+k}|u)]
 
     so that higher state uncertainty yields lower epistemic "value".
 
     Args:
-        qs1_pred_seq: (tau, S1) predictive top-level states
+        qs_top_pred: (tau, S_top) predictive top-level states
 
     Returns:
         epistemic: (tau,) epistemic term per horizon step
     """
     eps = 1e-16
-    log_q = jnp.log(jnp.clip(qs1_pred_seq, eps, 1.0))
-    entropy = -jnp.sum(qs1_pred_seq * log_q, axis=1)  # (tau,)
+    log_q = jnp.log(jnp.clip(qs_top_pred, eps, 1.0))
+    entropy = -jnp.sum(qs_top_pred * log_q, axis=1)  # (tau,)
     epistemic = -entropy
     return epistemic
 
@@ -234,7 +232,7 @@ def compute_epistemic_term_from_qs1_pred(
 def compute_expected_free_energy_paths(
     level_top: LorenzLevel,
     level0: LorenzLevel,
-    qs1_grid: jnp.ndarray,
+    qs_top_grid: jnp.ndarray,
     qs0_grid: jnp.ndarray,
     C: jnp.ndarray,
     tau: int = 3,
@@ -260,8 +258,8 @@ def compute_expected_free_energy_paths(
     Args:
         level_top: top-level LorenzLevel (with num_paths > 0 and B_states_paths)
         level0: lowest-level LorenzLevel (with A)
-        qs1_grid: (T, H1, W1, S1) top-level state posteriors (data)
-        qs0_grid: (T, H0, W0, S0) lowest-level state posteriors (data)
+        qs_top_grid: (T, H_top, W_top, S_top) top-level posteriors (data)
+        qs0_grid: (T, H0, W0, S0) lowest-level posteriors (data)
         C: (O0,) preference distribution over lowest-level outcomes
         tau: integer planning horizon (number of predictive steps)
 
@@ -272,32 +270,32 @@ def compute_expected_free_energy_paths(
     if U == 0:
         raise ValueError("compute_expected_free_energy_paths called with num_paths=0")
 
-    T = qs1_grid.shape[0]
+    T = qs_top_grid.shape[0]
 
     # If no path-specific dynamics, fall back to scalar G_t
-    if level_top.B_states_paths is None or level_top.B_states_paths.shape[2] <= 1:
+    B_states_paths = level_top.B_states_paths
+    if B_states_paths is None or B_states_paths.shape[2] <= 1:
+        # Approximate predictive distributions by current posteriors
         qs0_pred = qs0_grid.mean(axis=(1, 2))  # (T, S0)
         qs0_pred = qs0_pred / (qs0_pred.sum(axis=1, keepdims=True) + 1e-8)
 
-        # Single-step predictive observation (approximate)
         A0 = level0.A
         qo_pred = jax.vmap(lambda q: A0.T @ q)(qs0_pred)  # (T, O0)
         qo_pred = qo_pred / (qo_pred.sum(axis=1, keepdims=True) + 1e-8)
 
         risk = compute_risk_term(qo_pred, C)                        # (T,)
         ambiguity = compute_ambiguity_term(qs0_pred, level0)        # (T,)
-        epistemic = compute_epistemic_term_from_qs1_pred(
-            qs1_grid.mean(axis=(1, 2))
-        )  # (T,)
+        qs_top_mean = qs_top_grid.mean(axis=(1, 2))                 # (T, S_top)
+        epistemic = compute_epistemic_term_from_qs_top_pred(qs_top_mean)  # (T,)
 
         G_t = risk + ambiguity - epistemic
         return jnp.broadcast_to(G_t[:, None], (T, U))
 
     # Path-specific G_u via tau-step rollout
     def G_for_path(u_idx: int) -> float:
-        qs0_pred_u, qs1_pred_seq_u, qo_pred_u = rollout_predictive_states_under_path_tau(
+        qs0_pred_u, qs_top_pred_u, qo_pred_u = rollout_predictive_states_under_path_tau(
             qs0_grid,
-            qs1_grid,
+            qs_top_grid,
             level_top,
             level0,
             u_idx,
@@ -306,12 +304,11 @@ def compute_expected_free_energy_paths(
 
         risk_u = compute_risk_term(qo_pred_u, C)                      # (tau,)
         ambiguity_u = compute_ambiguity_term(qs0_pred_u, level0)      # (tau,)
-        epistemic_u = compute_epistemic_term_from_qs1_pred(
-            qs1_pred_seq_u
+        epistemic_u = compute_epistemic_term_from_qs_top_pred(
+            qs_top_pred_u
         )  # (tau,)
 
         G_seq = risk_u + ambiguity_u - epistemic_u  # (tau,)
-        # Aggregate over horizon; here we simply sum (no discounting).
         G_u = G_seq.sum()
         return G_u
 
