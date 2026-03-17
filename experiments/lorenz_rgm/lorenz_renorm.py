@@ -29,9 +29,6 @@ from typing import Dict, Any, Tuple, List, Optional
 import numpy as np
 import jax.numpy as jnp
 
-# Global debug flag
-DEBUG_RENORM = False
-
 # -----------------------------------------------------------------------------
 # 1. Utilities: reshape between flat and grid states
 # -----------------------------------------------------------------------------
@@ -113,12 +110,12 @@ def rg_step_level(states_grid: jnp.ndarray) -> Dict[str, Any]:
     Perform a single spatial RG step over a grid of states.
 
     We:
-      - assume H and W are even (non-overlapping 2x2 groups),
-      - group 2x2 blocks into "group-sites" with four child positions,
-      - for each group-site (h2,w2), build a local mapping from unique
-        child patterns to parent states, ensuring:
-        * no shared children between different group-sites (by construction),
-        * unique rows in D for each parent (one row per pattern).
+    - assume H and W are even (non-overlapping 2x2 groups),
+    - group 2x2 blocks into "group-sites" with four child positions,
+    - for each group-site (h2,w2), build a local mapping from unique
+      child patterns to parent states, ensuring:
+      * no shared children between different group-sites (by construction),
+      * unique rows in D for each parent (one row per pattern).
 
     Args:
       states_grid: (T, H, W) integer states at current level.
@@ -127,7 +124,7 @@ def rg_step_level(states_grid: jnp.ndarray) -> Dict[str, Any]:
       dict with:
         'parent_states_grid': (T, H2, W2) integer parent states
         'group_pattern_maps': list (length H2 * W2) of dicts
-           pattern_tuple (4,) -> parent_state_idx (global int)
+          pattern_tuple (4,) -> parent_state_idx (global int)
         'D': (num_parent_states_total, 4) child state patterns
         'group_shape': (H2, W2)
         'num_parent_states_total': total number of parent states
@@ -224,16 +221,16 @@ def build_spatial_hierarchy(
     Returns:
       dict with:
         'levels': list of level dicts, l = 0..L
-        level[0]:
-          {'states_grid': (T,H0,W0),
-           'group_shape': (H0,W0),
-           'D': None,
-           'group_pattern_maps': None}
-        level[l>0]:
-          {'states_grid': (T,H_l,W_l),
-           'group_shape': (H_l,W_l),
-           'D': (S_l,4),
-           'group_pattern_maps': list of dicts}
+          level[0]:
+            {'states_grid': (T,H0,W0),
+             'group_shape': (H0,W0),
+             'D': None,
+             'group_pattern_maps': None}
+          level[l>0]:
+            {'states_grid': (T,H_l,W_l),
+             'group_shape': (H_l,W_l),
+             'D': (S_l,4),
+             'group_pattern_maps': list of dicts}
         'T': T
     """
     assert num_levels >= 0, "num_levels must be >= 0."
@@ -304,7 +301,7 @@ def build_lorenz_spatial_hierarchy(
       dict with:
         'levels': list of level dicts (see build_spatial_hierarchy)
         'T': T (T0)
-        plus copies of useful fields from lorenz_data_dict:
+      plus copies of useful fields from lorenz_data_dict:
         'H_blocks', 'W_blocks', 'K', 'L', 'patch_size', 'img_size'
     """
     states_flat = lorenz_data_dict["states"]
@@ -330,16 +327,6 @@ def build_lorenz_spatial_hierarchy(
         "patch_size": int(lorenz_data_dict["patch_size"]),
         "img_size": int(lorenz_data_dict["img_size"]),
     }
-
-    if DEBUG_RENORM:
-        levels = result["levels"]
-        print("[build_lorenz_spatial_hierarchy] Spatial levels summary:")
-        for idx, lvl in enumerate(levels):
-            grid = lvl["states_grid"]
-            H_l, W_l = grid.shape[1], grid.shape[2]
-            D = lvl["D"]
-            S_l = D.shape[0] if D is not None else grid.max() + 1
-            print(f"  Level {idx}: (H,W)=({H_l},{W_l}), S_l≈{S_l}")
 
     return result
 
