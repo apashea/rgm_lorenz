@@ -709,6 +709,7 @@ def _infer_lorenz_hierarchy_core(
         if paths_active:
             qs_top_grid = qs_current[top_idx]
             level0_for_efe = level0
+            U = U_levels[top_idx]  # static int passed into core
 
             G_tu = compute_expected_free_energy_paths(
                 level_top=level_top,
@@ -717,6 +718,7 @@ def _infer_lorenz_hierarchy_core(
                 qs0_grid=qs_current[0],
                 C=C,
                 tau=2,
+                U=U,
             )
 
             qu_top_current = update_path_posterior_from_G(
