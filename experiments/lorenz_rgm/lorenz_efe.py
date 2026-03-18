@@ -217,6 +217,55 @@ def compute_epistemic_term_from_qs_top_pred(
 # 3. Expected free energy over paths (time-varying G_tu)
 # -----------------------------------------------------------------------------
 
+def compute_G_at_time(
+    level_top: LorenzLevel,
+    level0: LorenzLevel,
+    qs_top_marg_t: jnp.ndarray,  # (S_top,)
+    qs0_marg_t: jnp.ndarray,     # (S0,)
+    C: jnp.ndarray,              # (O0,)
+    tau: int,
+    U: int,
+) -> jnp.ndarray:
+    """
+    Compute G_t(u) for a single time t and all paths u, given
+    spatially-averaged marginals at time t.
+
+    Args:
+        level_top: top-level LorenzLevel (with B_states_paths)
+        level0: lowest-level LorenzLevel (with A)
+        qs_top_marg_t: (S_top,) top-level marginal at time t
+        qs0_marg_t: (S0,) lowest-level marginal at time t
+        C: (O0,) preference distribution over outcomes
+        tau: predictive horizon
+        U: number of paths
+
+    Returns:
+        G_t: (U,) expected free energy per path at time t
+    """
+    if U == 0:
+        raise ValueError("compute_G_at_time called with U=0")
+
+    def G_for_path_at_time(u_idx: int) -> float:
+        qs0_pred_u, qs_top_pred_u, qo_pred_u = rollout_predictive_states_under_path_tau(
+            qs0_start=qs0_marg_t,
+            qs_top_start=qs_top_marg_t,
+            level_top=level_top,
+            level0=level0,
+            u_idx=u_idx,
+            tau=tau,
+        )
+
+        risk_u = compute_risk_term(qo_pred_u, C)  # (tau,)
+        ambiguity_u = compute_ambiguity_term(qs0_pred_u, level0)  # (tau,)
+        epistemic_u = compute_epistemic_term_from_qs_top_pred(qs_top_pred_u)  # (tau,)
+
+        G_seq = risk_u + ambiguity_u - epistemic_u  # (tau,)
+        G_u = G_seq.sum()
+        return G_u
+
+    return jax.vmap(G_for_path_at_time)(jnp.arange(U))  # (U,)
+
+
 def compute_expected_free_energy_paths(
     level_top: LorenzLevel,
     level0: LorenzLevel,
@@ -231,7 +280,7 @@ def compute_expected_free_energy_paths(
     the top level, using a risk–ambiguity–epistemic decomposition over
     a multi-step horizon tau.
 
-    Behaviour (Stage 1):
+    Behaviour:
       - G(t, u) is computed separately for each time t.
       - For each t, we take the spatially-averaged marginals at time t,
         roll forward tau steps under each path, and aggregate risk,
@@ -276,46 +325,26 @@ def compute_expected_free_energy_paths(
         return jnp.broadcast_to(G_t[:, None], (T, U))
 
     # General case: path-specific B_states_paths and time-varying G(t,u).
-    # We use a per-time, per-path rollout.
+    # We use a per-time, per-path rollout from the marginals at each t.
     qs0_marg_all = qs0_grid.mean(axis=(1, 2))  # (T, S0)
     qs0_marg_all = qs0_marg_all / (qs0_marg_all.sum(axis=1, keepdims=True) + 1e-8)
 
     qs_top_marg_all = qs_top_grid.mean(axis=(1, 2))  # (T, S_top)
     qs_top_marg_all = qs_top_marg_all / (qs_top_marg_all.sum(axis=1, keepdims=True) + 1e-8)
 
-    def G_at_time(t: int) -> jnp.ndarray:
-        """
-        Compute G_t(u) for a fixed time index t, for all paths u.
-        Uses a fixed planning horizon tau.
-        """
-        qs0_start = qs0_marg_all[t]       # (S0,)
-        qs_top_start = qs_top_marg_all[t] # (S_top,)
+    def G_at_time_idx(t_idx: int) -> jnp.ndarray:
+        return compute_G_at_time(
+            level_top=level_top,
+            level0=level0,
+            qs_top_marg_t=qs_top_marg_all[t_idx],
+            qs0_marg_t=qs0_marg_all[t_idx],
+            C=C,
+            tau=tau,
+            U=U,
+        )
 
-        def G_for_path_at_time(u_idx: int) -> float:
-            qs0_pred_u, qs_top_pred_u, qo_pred_u = rollout_predictive_states_under_path_tau(
-                qs0_start,
-                qs_top_start,
-                level_top,
-                level0,
-                u_idx,
-                tau,  # fixed, concrete horizon
-            )
-
-            risk_u = compute_risk_term(qo_pred_u, C)  # (tau,)
-            ambiguity_u = compute_ambiguity_term(qs0_pred_u, level0)  # (tau,)
-            epistemic_u = compute_epistemic_term_from_qs_top_pred(
-                qs_top_pred_u
-            )  # (tau,)
-
-            G_seq = risk_u + ambiguity_u - epistemic_u  # (tau,)
-            G_u = G_seq.sum()
-            return G_u
-
-        G_u_vec = jax.vmap(G_for_path_at_time)(jnp.arange(U))  # (U,)
-        return G_u_vec
-
-    # Vectorize G_at_time over t
-    G_tu = jax.vmap(G_at_time)(jnp.arange(T))  # (T, U)
+    # Vectorize over time
+    G_tu = jax.vmap(G_at_time_idx)(jnp.arange(T))  # (T, U)
     return G_tu
 
 
