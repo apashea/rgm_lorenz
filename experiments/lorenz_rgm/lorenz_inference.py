@@ -21,9 +21,8 @@ The implementation here is optimized by:
 - Vectorizing lowest-level and higher-level VMP over spatial sites using vmap
   (no Python loops over (h,w) at parent/child levels).
 
-We do NOT jit the full hierarchical inference entry point here, because
-hierarchy and params are Python objects (not pure JAX arrays). That can
-be revisited later by registering them as pytrees or marking them static.
+We now jit the core hierarchical inference (inner function) using JAX,
+treating LorenzHierarchy and LorenzRGMParams as pytrees (see lorenz_model.py).
 """
 
 from typing import List, Dict, Any, Tuple, Optional
@@ -117,6 +116,7 @@ def prefs_from_params(
     assert C.shape[0] == O0, "prefs_from_params: pref_alpha shape mismatch with K*L."
     return C
 
+
 # -----------------------------------------------------------------------------
 # 2. Single-chain VMP using A and a temporal kernel (no spatial coupling)
 # -----------------------------------------------------------------------------
@@ -185,6 +185,7 @@ def vmp_single_chain(
     qs = jax.lax.fori_loop(0, num_iter, body_fun, qs)
     return qs
 
+
 # -----------------------------------------------------------------------------
 # 3. Vectorized lowest-level inference over patches
 # -----------------------------------------------------------------------------
@@ -252,6 +253,7 @@ def infer_lowest_level_patches(
 
     qs0_grid = qs_flat.reshape(T0, H0, W0, S0)
     return qs0_grid
+
 
 # -----------------------------------------------------------------------------
 # 4. Bottom-up and top-down messages via D_state_from_parent
@@ -359,6 +361,7 @@ def top_down_prior_parent_to_child(
         return bias
 
     return jax.vmap(bias_for_time)(jnp.arange(T))  # (T, Hc, Wc, S_child)
+
 
 # -----------------------------------------------------------------------------
 # 5. Vectorized two-level VMP (child-parent) over spatial sites
@@ -573,6 +576,7 @@ def vmp_two_level_states(
     )
     return qs_child_final, qs_parent_final
 
+
 # -----------------------------------------------------------------------------
 # 6. High-level inference entry point with multi-level states and EFE-based paths
 # -----------------------------------------------------------------------------
@@ -587,7 +591,10 @@ def _infer_lorenz_hierarchy_inner(
     pref_mode: str,
 ) -> Dict[str, Any]:
     """
-    Core inference logic (non-jitted) for the Lorenz hierarchy.
+    Core inference logic for the Lorenz hierarchy.
+
+    This function is jitted via _infer_lorenz_hierarchy_inner_jit; hierarchy
+    and params are pytrees (see lorenz_model.py).
     """
     T0 = hierarchy.T0
     H0 = hierarchy.H_blocks
@@ -719,6 +726,13 @@ def _infer_lorenz_hierarchy_inner(
     }
 
 
+# JIT-compiled inner inference
+_infer_lorenz_hierarchy_inner_jit = jax.jit(
+    _infer_lorenz_hierarchy_inner,
+    static_argnames=("num_iter_lowest", "num_iter_hier", "efe_gamma", "pref_mode"),
+)
+
+
 def infer_lorenz_hierarchy(
     hierarchy: LorenzHierarchy,
     lorenz_data_dict: Dict[str, Any],
@@ -732,11 +746,10 @@ def infer_lorenz_hierarchy(
     Public entry point for variational inference over states and (optional)
     paths in the Lorenz hierarchy.
 
-    This calls the inner implementation WITHOUT jitting hierarchy/params,
-    to avoid type issues with non-array arguments. The core RGM structure
-    and update equations are unchanged.
+    This calls the jitted inner implementation, with hierarchy and params
+    treated as pytrees (see lorenz_model.py).
     """
-    return _infer_lorenz_hierarchy_inner(
+    return _infer_lorenz_hierarchy_inner_jit(
         hierarchy=hierarchy,
         lorenz_data_dict=lorenz_data_dict,
         params=params,
