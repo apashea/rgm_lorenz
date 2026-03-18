@@ -22,7 +22,7 @@ The implementation here is optimized by:
   (no Python loops over (h,w) at parent/child levels).
 
 We jit a core hierarchical inference routine using JAX, but we avoid using
-traced values as shapes by:
+traced values as shapes or in Python conditionals by:
 - Precomputing observation tensors and scalar hyperparameters (T0, H0, W0, K, L)
   outside JIT.
 - Precomputing per-level state and path counts (S_levels, U_levels) outside JIT.
@@ -709,7 +709,7 @@ def _infer_lorenz_hierarchy_core(
         if paths_active:
             qs_top_grid = qs_current[top_idx]
             level0_for_efe = level0
-            U = U_levels[top_idx]  # static int passed into core
+            U = U_levels[top_idx]
 
             G_tu = compute_expected_free_energy_paths(
                 level_top=level_top,
@@ -724,6 +724,7 @@ def _infer_lorenz_hierarchy_core(
             qu_top_current = update_path_posterior_from_G(
                 level_top,
                 G_tu,
+                U=U,
                 gamma=efe_gamma,
                 num_iter=2,
             )
