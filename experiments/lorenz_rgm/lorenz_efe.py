@@ -340,6 +340,7 @@ def compute_expected_free_energy_paths(
 def update_path_posterior_from_G(
     level_top: LorenzLevel,
     G_tu: jnp.ndarray,
+    U: int,
     gamma: float = 16.0,
     num_iter: int = 2,
 ) -> jnp.ndarray:
@@ -352,17 +353,17 @@ def update_path_posterior_from_G(
     Then perform VMP over the path chain using C_paths and E_paths.
 
     Args:
-        level_top: top-level LorenzLevel with C_paths, E_paths, num_paths > 0
+        level_top: top-level LorenzLevel with C_paths, E_paths
         G_tu: (T, U) expected free energy per time and path
+        U: number of paths (concrete int, passed from outside JIT)
         gamma: precision over expected free energy
         num_iter: number of VMP iterations over the path chain
 
     Returns:
         qu_t: (T, U) posterior over paths at each time
     """
-    U = level_top.num_paths
     if U == 0:
-        raise ValueError("update_path_posterior_from_G called with num_paths=0")
+        raise ValueError("update_path_posterior_from_G called with U=0")
 
     C_paths = level_top.C_paths  # (U, U)
     E_paths = level_top.E_paths  # (U,)
@@ -371,7 +372,7 @@ def update_path_posterior_from_G(
         raise ValueError("Top level must define C_paths and E_paths for path inference.")
 
     T, U_check = G_tu.shape
-    assert U_check == U, "G_tu shape inconsistent with num_paths."
+    assert U_check == U, "G_tu shape inconsistent with U."
 
     # Prior over u_t based on EFE: p(u_t) ∝ exp(-gamma * G_tu)
     def prior_u_t(G_t: jnp.ndarray) -> jnp.ndarray:
