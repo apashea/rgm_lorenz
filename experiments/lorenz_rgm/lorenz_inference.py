@@ -21,10 +21,12 @@ The implementation here is optimized by:
 - Vectorizing lowest-level and higher-level VMP over spatial sites using vmap
   (no Python loops over (h,w) at parent/child levels).
 
-We now jit the core hierarchical inference using JAX, but we avoid passing
-the raw lorenz_data_dict into the jitted function. Instead we precompute
-obs_flat and scalar hyperparameters (T0, H0, W0, K, L) outside JIT and
-pass only JAX arrays + Python ints into the jitted core.
+We jit a core hierarchical inference routine using JAX, but we avoid using
+traced values as shapes by:
+- Precomputing observation tensors and scalar hyperparameters (T0, H0, W0, K, L)
+  outside JIT.
+- Precomputing per-level state and path counts (S_levels, U_levels) outside JIT.
+- Passing only arrays and Python ints into the jitted core.
 """
 
 from typing import List, Dict, Any, Tuple, Optional
@@ -603,6 +605,8 @@ def _infer_lorenz_hierarchy_core(
     W0: int,
     K: int,
     L: int,
+    S_levels: Tuple[int, ...],
+    U_levels: Tuple[int, ...],
     num_iter_lowest: int,
     num_iter_hier: int,
     efe_gamma: float,
@@ -643,33 +647,29 @@ def _infer_lorenz_hierarchy_core(
     qs_current: List[Optional[jnp.ndarray]] = [None] * num_levels
     qs_current[0] = qs0_grid
 
+    # Initialize higher levels using precomputed S_levels
     for l in range(1, num_levels):
-        level_l = hierarchy.levels[l]
         states_grid_l = states_grids[l]
         Tl, Hl, Wl = states_grid_l.shape
         assert Tl == T0
+        S_l = S_levels[l]
         qs_current[l] = jnp.full(
-            (T0, Hl, Wl, level_l.S),
-            1.0 / level_l.S,
+            (T0, Hl, Wl, S_l),
+            1.0 / S_l,
             dtype=jnp.float32,
         )
 
+    # Determine top_idx (highest level with paths) from U_levels
     top_idx = None
     for idx in reversed(range(num_levels)):
-        lvl = hierarchy.levels[idx]
-        if (
-            lvl.num_paths is not None
-            and lvl.num_paths > 1
-            and lvl.C_paths is not None
-            and lvl.E_paths is not None
-        ):
+        if U_levels[idx] is not None and U_levels[idx] > 1:
             top_idx = idx
             break
 
     paths_active = top_idx is not None
     if paths_active:
         level_top = hierarchy.levels[top_idx]
-        U = level_top.num_paths
+        U = U_levels[top_idx]
         qu_top = jnp.full((T0, U), 1.0 / U, dtype=jnp.float32)
     else:
         level_top = None
@@ -746,6 +746,8 @@ _infer_lorenz_hierarchy_core_jit = jax.jit(
         "W0",
         "K",
         "L",
+        "S_levels",
+        "U_levels",
         "num_iter_lowest",
         "num_iter_hier",
         "efe_gamma",
@@ -769,6 +771,7 @@ def infer_lorenz_hierarchy(
 
     This wrapper:
       - extracts scalars and builds obs_flat outside JIT,
+      - precomputes per-level S and U from the hierarchy,
       - calls the jitted core that only sees arrays and plain ints.
     """
     K = int(lorenz_data_dict["K"])
@@ -779,6 +782,13 @@ def infer_lorenz_hierarchy(
 
     obs_flat = build_lowest_level_observations_flat(lorenz_data_dict)  # (N, O)
 
+    num_levels = len(hierarchy.levels)
+    S_levels = tuple(level.S for level in hierarchy.levels)
+    U_levels = tuple(
+        level.num_paths if (level.num_paths is not None) else 0
+        for level in hierarchy.levels
+    )
+
     return _infer_lorenz_hierarchy_core_jit(
         hierarchy=hierarchy,
         params=params,
@@ -788,6 +798,8 @@ def infer_lorenz_hierarchy(
         W0=W0,
         K=K,
         L=L,
+        S_levels=S_levels,
+        U_levels=U_levels,
         num_iter_lowest=num_iter_lowest,
         num_iter_hier=num_iter_hier,
         efe_gamma=efe_gamma,
