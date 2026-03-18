@@ -52,7 +52,7 @@ def rollout_predictive_states_under_path_tau(
     """
     Roll out predictive state and observation distributions under a fixed
     path u over a horizon tau, starting from given marginals at a single
-    time point (not from the end of the sequence).
+    time point.
 
     Args:
         qs0_start: (S0,) starting marginal over level-0 states
@@ -231,13 +231,11 @@ def compute_expected_free_energy_paths(
     the top level, using a risk–ambiguity–epistemic decomposition over
     a multi-step horizon tau.
 
-    New behaviour (Stage 1):
+    Behaviour (Stage 1):
       - G(t, u) is computed separately for each time t.
       - For each t, we take the spatially-averaged marginals at time t,
         roll forward tau steps under each path, and aggregate risk,
         ambiguity, and epistemic terms over the horizon.
-      - Near the end of the sequence, we clamp the horizon so that
-        t + tau does not exceed T.
 
     Args:
         level_top: top-level LorenzLevel (with B_states_paths)
@@ -288,14 +286,10 @@ def compute_expected_free_energy_paths(
     def G_at_time(t: int) -> jnp.ndarray:
         """
         Compute G_t(u) for a fixed time index t, for all paths u.
-        We allow a truncated horizon near the end of the sequence.
+        Uses a fixed planning horizon tau.
         """
-        # Effective horizon from this t
-        remaining = T - 1 - t
-        tau_eff = jnp.minimum(tau, remaining + 1)  # at least 1 step if remaining >= 0
-
-        qs0_start = qs0_marg_all[t]      # (S0,)
-        qs_top_start = qs_top_marg_all[t]  # (S_top,)
+        qs0_start = qs0_marg_all[t]       # (S0,)
+        qs_top_start = qs_top_marg_all[t] # (S_top,)
 
         def G_for_path_at_time(u_idx: int) -> float:
             qs0_pred_u, qs_top_pred_u, qo_pred_u = rollout_predictive_states_under_path_tau(
@@ -304,16 +298,16 @@ def compute_expected_free_energy_paths(
                 level_top,
                 level0,
                 u_idx,
-                tau_eff,
+                tau,  # fixed, concrete horizon
             )
 
-            risk_u = compute_risk_term(qo_pred_u, C)  # (tau_eff,)
-            ambiguity_u = compute_ambiguity_term(qs0_pred_u, level0)  # (tau_eff,)
+            risk_u = compute_risk_term(qo_pred_u, C)  # (tau,)
+            ambiguity_u = compute_ambiguity_term(qs0_pred_u, level0)  # (tau,)
             epistemic_u = compute_epistemic_term_from_qs_top_pred(
                 qs_top_pred_u
-            )  # (tau_eff,)
+            )  # (tau,)
 
-            G_seq = risk_u + ambiguity_u - epistemic_u  # (tau_eff,)
+            G_seq = risk_u + ambiguity_u - epistemic_u  # (tau,)
             G_u = G_seq.sum()
             return G_u
 
