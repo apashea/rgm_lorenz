@@ -21,8 +21,10 @@ The implementation here is optimized by:
 - Vectorizing lowest-level and higher-level VMP over spatial sites using vmap
   (no Python loops over (h,w) at parent/child levels).
 
-We now jit the core hierarchical inference (inner function) using JAX,
-treating LorenzHierarchy and LorenzRGMParams as pytrees (see lorenz_model.py).
+We now jit the core hierarchical inference using JAX, but we avoid passing
+the raw lorenz_data_dict into the jitted function. Instead we precompute
+obs_flat and scalar hyperparameters (T0, H0, W0, K, L) outside JIT and
+pass only JAX arrays + Python ints into the jitted core.
 """
 
 from typing import List, Dict, Any, Tuple, Optional
@@ -40,6 +42,7 @@ from .lorenz_efe import (
 
 # Global debug flag for this module
 DEBUG_INFERENCE = False
+
 
 # -----------------------------------------------------------------------------
 # 1. Utilities: observations and preferences for lowest level
@@ -86,7 +89,7 @@ def build_lowest_level_observations_grid(
 ) -> jnp.ndarray:
     """
     Build an observation array reshaped as (T, H0, W0, O) for patch-wise
-    inference.
+    inference (non-jitted path that still uses the dict).
     """
     obs_flat = build_lowest_level_observations_flat(lorenz_data_dict)  # (N, O)
     T0 = int(lorenz_data_dict["T"])
@@ -215,36 +218,28 @@ def vmp_lowest_level_sites(
         # obs_chain: (T0, O)
         return vmp_single_chain(A0, B0, E0, obs_chain, num_iter=num_iter)  # (T0, S0)
 
-    # Vectorize over site dimension (axis=1)
     qs_sites = jax.vmap(vmp_site, in_axes=1, out_axes=1)(obs_flat)  # (T0, N0, S0)
     return qs_sites
 
 
-def infer_lowest_level_patches(
+def infer_lowest_level_patches_from_obs(
     level0: LorenzLevel,
-    lorenz_data_dict: Dict[str, Any],
+    obs_grid: jnp.ndarray,
     num_iter_lowest: int = 8,
 ) -> jnp.ndarray:
     """
-    Run VMP at the lowest level independently for each patch, vectorized
-    over patches (sites).
+    Run VMP at the lowest level given an observation grid (T0, H0, W0, O).
 
-    For now, we approximate temporal dynamics at level 0 with an identity
-    kernel (persistence), since all path-dependent dynamics are attached
-    to higher levels.
-
-    Returns:
-      qs0_grid: (T0, H0, W0, S0)
+    This variant is used by the jitted core and does not depend on
+    lorenz_data_dict directly.
     """
     A0 = level0.A
     E0 = level0.E_states
 
-    obs_grid = build_lowest_level_observations_grid(lorenz_data_dict)  # (T0, H0, W0, O)
     T0, H0, W0, O = obs_grid.shape
     S0 = A0.shape[0]
     N0 = H0 * W0
 
-    # Flatten spatial dimensions to a site axis
     obs_flat = obs_grid.reshape(T0, N0, O)  # (T0, N0, O)
 
     qs_flat = vmp_lowest_level_sites(
@@ -253,6 +248,24 @@ def infer_lowest_level_patches(
 
     qs0_grid = qs_flat.reshape(T0, H0, W0, S0)
     return qs0_grid
+
+
+def infer_lowest_level_patches(
+    level0: LorenzLevel,
+    lorenz_data_dict: Dict[str, Any],
+    num_iter_lowest: int = 8,
+) -> jnp.ndarray:
+    """
+    Non-jitted convenience wrapper that still takes lorenz_data_dict and
+    uses build_lowest_level_observations_grid.
+
+    Returns:
+      qs0_grid: (T0, H0, W0, S0)
+    """
+    obs_grid = build_lowest_level_observations_grid(lorenz_data_dict)
+    return infer_lowest_level_patches_from_obs(
+        level0, obs_grid, num_iter_lowest=num_iter_lowest
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -578,13 +591,18 @@ def vmp_two_level_states(
 
 
 # -----------------------------------------------------------------------------
-# 6. High-level inference entry point with multi-level states and EFE-based paths
+# 6. Core hierarchical inference (JIT-safe) and public wrapper
 # -----------------------------------------------------------------------------
 
-def _infer_lorenz_hierarchy_inner(
+def _infer_lorenz_hierarchy_core(
     hierarchy: LorenzHierarchy,
-    lorenz_data_dict: Dict[str, Any],
     params: Optional[LorenzRGMParams],
+    obs_flat: jnp.ndarray,     # (N, O)
+    T0: int,
+    H0: int,
+    W0: int,
+    K: int,
+    L: int,
     num_iter_lowest: int,
     num_iter_hier: int,
     efe_gamma: float,
@@ -593,30 +611,24 @@ def _infer_lorenz_hierarchy_inner(
     """
     Core inference logic for the Lorenz hierarchy.
 
-    This function is jitted via _infer_lorenz_hierarchy_inner_jit; hierarchy
-    and params are pytrees (see lorenz_model.py).
+    This function assumes obs_flat and scalar hyperparameters have already
+    been prepared outside of JIT. It does not touch lorenz_data_dict.
     """
-    T0 = hierarchy.T0
-    H0 = hierarchy.H_blocks
-    W0 = hierarchy.W_blocks
-
     level0: LorenzLevel = hierarchy.levels[0]
 
-    obs_flat = build_lowest_level_observations_flat(lorenz_data_dict)  # (N, O)
     N = obs_flat.shape[0]
     assert N == T0 * H0 * W0, "Observation length mismatch."
 
     if params is not None:
-        K = int(lorenz_data_dict["K"])
-        L = int(lorenz_data_dict["L"])
         C = prefs_from_params(params, K, L)
     else:
         C = obs_flat.mean(axis=0)
         C = C / (C.sum() + 1e-8)
 
-    # Level 0
-    qs0_grid = infer_lowest_level_patches(
-        level0, lorenz_data_dict, num_iter_lowest=num_iter_lowest
+    # Level 0: rebuild obs_grid and run lowest-level inference
+    obs_grid = obs_flat.reshape(T0, H0, W0, obs_flat.shape[1])
+    qs0_grid = infer_lowest_level_patches_from_obs(
+        level0, obs_grid, num_iter_lowest=num_iter_lowest
     )
 
     num_levels = len(hierarchy.levels)
@@ -726,10 +738,19 @@ def _infer_lorenz_hierarchy_inner(
     }
 
 
-# JIT-compiled inner inference
-_infer_lorenz_hierarchy_inner_jit = jax.jit(
-    _infer_lorenz_hierarchy_inner,
-    static_argnames=("num_iter_lowest", "num_iter_hier", "efe_gamma", "pref_mode"),
+_infer_lorenz_hierarchy_core_jit = jax.jit(
+    _infer_lorenz_hierarchy_core,
+    static_argnames=(
+        "T0",
+        "H0",
+        "W0",
+        "K",
+        "L",
+        "num_iter_lowest",
+        "num_iter_hier",
+        "efe_gamma",
+        "pref_mode",
+    ),
 )
 
 
@@ -746,13 +767,27 @@ def infer_lorenz_hierarchy(
     Public entry point for variational inference over states and (optional)
     paths in the Lorenz hierarchy.
 
-    This calls the jitted inner implementation, with hierarchy and params
-    treated as pytrees (see lorenz_model.py).
+    This wrapper:
+      - extracts scalars and builds obs_flat outside JIT,
+      - calls the jitted core that only sees arrays and plain ints.
     """
-    return _infer_lorenz_hierarchy_inner_jit(
+    K = int(lorenz_data_dict["K"])
+    L = int(lorenz_data_dict["L"])
+    T0 = int(lorenz_data_dict["T"])
+    H0 = int(lorenz_data_dict["H_blocks"])
+    W0 = int(lorenz_data_dict["W_blocks"])
+
+    obs_flat = build_lowest_level_observations_flat(lorenz_data_dict)  # (N, O)
+
+    return _infer_lorenz_hierarchy_core_jit(
         hierarchy=hierarchy,
-        lorenz_data_dict=lorenz_data_dict,
         params=params,
+        obs_flat=obs_flat,
+        T0=T0,
+        H0=H0,
+        W0=W0,
+        K=K,
+        L=L,
         num_iter_lowest=num_iter_lowest,
         num_iter_hier=num_iter_hier,
         efe_gamma=efe_gamma,
